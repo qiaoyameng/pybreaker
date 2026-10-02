@@ -73,6 +73,26 @@ requests before closing the circuit breaker:
     # Require 3 successful requests before closing
     db_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60, success_threshold=3)
 
+Instead of counting consecutive failures, the circuit breaker can also trip
+based on the failure rate observed over a sliding time window, which is more
+representative of the overall health of high-throughput integration points:
+
+.. code:: python
+
+    # Open the circuit when at least 50% of the calls fail within a 60 second
+    # window, but only once at least 20 calls were seen in that window
+    db_breaker = pybreaker.CircuitBreaker(
+        failure_rate_threshold=0.5,
+        window_duration=60,
+        window_min_calls=20,
+        reset_timeout=60,
+    )
+
+The window advances on a monotonic clock, so samples recorded before a long
+idle period do not count towards the failure rate. Excluded exceptions are
+not counted as window samples at all. The current window contents can be
+inspected through the ``window_stats`` property.
+
 .. note::
 
   Integration points to external services (i.e. databases, queues, etc) are

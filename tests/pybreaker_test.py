@@ -1,4 +1,5 @@
 import unittest
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from time import sleep
@@ -1350,6 +1351,318 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         mock_fn.assert_called_once()
         assert breaker.fail_counter == 0
         assert breaker.current_state == "closed"
+
+
+class FakeClock:
+    """Deterministic monotonic clock for sliding window tests."""
+
+    def __init__(self, start=1000.0):
+        self._now = float(start)
+
+    def __call__(self):
+        return self._now
+
+    def advance(self, seconds):
+        self._now += seconds
+
+
+class CircuitBreakerSlidingWindowTestCase(unittest.TestCase):
+    """Tests for the sliding window failure rate strategy."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+
+    def _make_breaker(self, **kwargs):
+        kwargs.setdefault("time_func", self.clock)
+        return CircuitBreaker(**kwargs)
+
+    def _suc(self):
+        return True
+
+    def _err(self):
+        raise NotImplementedError
+
+    def _assert_stats(self, breaker, sample_count, failure_count, failure_rate):
+        stats = breaker.window_stats
+        assert stats is not None
+        assert stats.sample_count == sample_count
+        assert stats.failure_count == failure_count
+        assert stats.failure_rate == pytest.approx(failure_rate)
+        assert breaker.fail_counter == failure_count
+
+    def test_default_strategy_is_consecutive_failures(self):
+        """CircuitBreaker: it should keep the consecutive failure strategy by default."""
+        breaker = CircuitBreaker()
+        assert breaker.window_stats is None
+        assert breaker.failure_rate_threshold is None
+        assert breaker.window_duration is None
+        assert breaker.window_min_calls == 1
+
+    def test_invalid_window_configuration(self):
+        """CircuitBreaker: it should reject incomplete or invalid window settings."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_rate_threshold=0.5)
+        with pytest.raises(ValueError):
+            CircuitBreaker(window_duration=10)
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_rate_threshold=0, window_duration=10)
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_rate_threshold=1.5, window_duration=10)
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_rate_threshold=0.5, window_duration=0)
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_rate_threshold=0.5, window_duration=10, window_min_calls=0)
+
+    def test_window_opens_when_failure_rate_reached(self):
+        """CircuitBreaker: it should open once enough samples fail at or above
+        the failure rate threshold.
+        """
+
+        class Listener(CircuitBreakerListener):
+            def __init__(self):
+                self.out = ""
+
+            def state_change(self, cb, old_state, new_state):
+                if old_state:
+                    self.out += old_state.name
+                self.out += "->" + new_state.name + ","
+
+        listener = Listener()
+        breaker = self._make_breaker(
+            failure_rate_threshold=0.5,
+            window_duration=10,
+            window_min_calls=4,
+            listeners=(listener,),
+        )
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 1, 1, 1.0)
+        assert breaker.current_state == "closed"  # not enough samples yet
+
+        assert breaker.call(self._suc)
+        self._assert_stats(breaker, 2, 1, 0.5)
+        assert breaker.current_state == "closed"
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 3, 2, 2 / 3)
+        assert breaker.current_state == "closed"  # still not enough samples
+
+        assert breaker.call(self._suc)
+        self._assert_stats(breaker, 4, 2, 0.5)
+        assert breaker.current_state == "closed"  # successes don't trip the circuit
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 5, 3, 0.6)
+        assert breaker.current_state == "open"
+        assert listener.out == "closed->open,"
+
+    def test_window_requires_min_calls(self):
+        """CircuitBreaker: it should stay closed while the window holds too few samples."""
+        breaker = self._make_breaker(failure_rate_threshold=0.5, window_duration=10, window_min_calls=5)
+
+        for _ in range(4):
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+        self._assert_stats(breaker, 4, 4, 1.0)
+        assert breaker.current_state == "closed"  # 100% failure rate, but too few samples
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 5, 5, 1.0)
+        assert breaker.current_state == "open"
+
+    def test_window_samples_expire_across_bucket_boundary(self):
+        """CircuitBreaker: it should only count samples inside the current window."""
+        breaker = self._make_breaker(
+            failure_rate_threshold=0.7,
+            window_duration=10,
+            window_min_calls=2,
+        )
+
+        # Buckets are 1s long; these two calls land in bucket 1000.
+        self.clock.advance(0.4)
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self.clock.advance(0.5)
+        assert breaker.call(self._suc)
+        self._assert_stats(breaker, 2, 1, 0.5)
+        assert breaker.current_state == "closed"
+
+        # t=1009.9: bucket 1000 is still inside the window.
+        self.clock.advance(9.0)
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 3, 2, 2 / 3)
+        assert breaker.current_state == "closed"  # 2/3 < 0.7
+
+        # t=1010.1: bucket 1000 expired, only the last failure remains.
+        self.clock.advance(0.2)
+        assert breaker.call(self._suc)
+        self._assert_stats(breaker, 2, 1, 0.5)
+        assert breaker.current_state == "closed"
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 3, 2, 2 / 3)
+        assert breaker.current_state == "closed"
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 4, 3, 0.75)
+        assert breaker.current_state == "open"
+
+    def test_window_idle_period_discards_old_failures(self):
+        """CircuitBreaker: it should not trip on stale failures after a long
+        idle period.
+        """
+        breaker = self._make_breaker(
+            failure_rate_threshold=0.5,
+            window_duration=10,
+            window_min_calls=3,
+        )
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 2, 2, 1.0)
+
+        # No calls for a long time: the window must be empty again.
+        self.clock.advance(300)
+        self._assert_stats(breaker, 0, 0, 0.0)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 1, 1, 1.0)
+        assert breaker.current_state == "closed"  # old failures are gone
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.current_state == "closed"
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 3, 3, 1.0)
+        assert breaker.current_state == "open"
+
+    def test_window_huge_time_jump(self):
+        """CircuitBreaker: it should handle arbitrarily large clock jumps
+        without delay and without keeping stale samples.
+        """
+        breaker = self._make_breaker(
+            failure_rate_threshold=0.5,
+            window_duration=10,
+            window_min_calls=10,
+        )
+
+        for _ in range(3):
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+        self._assert_stats(breaker, 3, 3, 1.0)
+
+        self.clock.advance(10**9)
+        self._assert_stats(breaker, 0, 0, 0.0)
+        assert breaker.current_state == "closed"
+
+        for _ in range(9):
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+        self._assert_stats(breaker, 9, 9, 1.0)
+        assert breaker.current_state == "closed"
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        assert breaker.current_state == "open"
+
+    def test_window_excluded_exceptions_are_not_samples(self):
+        """CircuitBreaker: it should not count excluded exceptions in the
+        window, neither as failures nor as successes.
+        """
+        breaker = self._make_breaker(
+            failure_rate_threshold=0.5,
+            window_duration=10,
+            window_min_calls=2,
+            exclude=[LookupError],
+        )
+
+        def excluded():
+            raise LookupError
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 1, 1, 1.0)
+
+        with pytest.raises(LookupError):
+            breaker.call(excluded)
+        self._assert_stats(breaker, 1, 1, 1.0)  # not in the denominator
+        assert breaker.current_state == "closed"
+
+        assert breaker.call(self._suc)
+        self._assert_stats(breaker, 2, 1, 0.5)
+
+        with pytest.raises(LookupError):
+            breaker.call(excluded)
+        self._assert_stats(breaker, 2, 1, 0.5)
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 3, 2, 2 / 3)
+        assert breaker.current_state == "open"
+
+    def test_window_manual_close_resets_stats(self):
+        """CircuitBreaker: it should reset the window when closed manually."""
+        breaker = self._make_breaker(
+            failure_rate_threshold=0.5,
+            window_duration=10,
+            window_min_calls=2,
+        )
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        assert breaker.current_state == "open"
+        self._assert_stats(breaker, 2, 2, 1.0)
+
+        breaker.close()
+        assert breaker.current_state == "closed"
+        self._assert_stats(breaker, 0, 0, 0.0)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        self._assert_stats(breaker, 1, 1, 1.0)
+        assert breaker.current_state == "closed"
+
+    def test_window_closes_after_reset_timeout(self):
+        """CircuitBreaker: it should reset the window when the circuit closes
+        after a successful trial call.
+        """
+        breaker = self._make_breaker(
+            failure_rate_threshold=0.5,
+            window_duration=10,
+            window_min_calls=2,
+            reset_timeout=0.05,
+        )
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        assert breaker.current_state == "open"
+
+        sleep(0.06)
+
+        assert breaker.call(self._suc)
+        assert breaker.current_state == "closed"
+        self._assert_stats(breaker, 0, 0, 0.0)
+
+    def test_window_uses_monotonic_clock_by_default(self):
+        """CircuitBreaker: it should default to the monotonic clock."""
+        breaker = CircuitBreaker(failure_rate_threshold=0.5, window_duration=10)
+        assert breaker._window._clock is time.monotonic
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from typing import (
     Any,
     Callable,
     Literal,
+    NamedTuple,
     NoReturn,
     TypeVar,
     Union,
@@ -63,6 +64,7 @@ __all__ = (
     "CircuitBreakerError",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
+    "WindowStats",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
@@ -72,10 +74,93 @@ STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
 
+_DEFAULT_WINDOW_BUCKETS = 10
+
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
 CBListenerType = TypeVar("CBListenerType", bound="CircuitBreakerListener")
 CBStateType = Union["CircuitClosedState", "CircuitHalfOpenState", "CircuitOpenState"]
+
+
+class WindowStats(NamedTuple):
+    """Point-in-time view of a sliding window: how many calls were seen in the
+    current window, how many of them failed, and the resulting failure rate.
+    """
+
+    sample_count: int
+    failure_count: int
+    failure_rate: float
+
+
+class SlidingWindowMetrics:
+    """Track successes and failures over a sliding time window.
+
+    Time is divided into buckets of ``window_duration / num_buckets`` seconds,
+    addressed by their index on a monotonic clock. Because buckets are stored
+    in a dict keyed by index, advancing the clock - even by a huge amount -
+    never requires creating intermediate empty buckets: stale entries are
+    dropped by index comparison only.
+    """
+
+    def __init__(
+        self,
+        window_duration: float,
+        num_buckets: int = _DEFAULT_WINDOW_BUCKETS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Create a new window of `window_duration` seconds, read from `clock`."""
+        self._window_duration = float(window_duration)
+        self._num_buckets = int(num_buckets)
+        self._bucket_duration = self._window_duration / self._num_buckets
+        self._clock = clock
+        self._buckets: dict[int, list[int]] = {}
+        self._lock = threading.Lock()
+
+    def _current_bucket_index(self) -> int:
+        return int(self._clock() // self._bucket_duration)
+
+    def _prune_locked(self, current_index: int) -> None:
+        cutoff = current_index - self._num_buckets + 1
+        for index in list(self._buckets):
+            if index < cutoff:
+                del self._buckets[index]
+
+    def _record_locked(self, failed: bool) -> None:
+        index = self._current_bucket_index()
+        self._prune_locked(index)
+        bucket = self._buckets.setdefault(index, [0, 0])
+        bucket[1 if failed else 0] += 1
+
+    def record_success(self) -> None:
+        """Record a successful call in the current bucket."""
+        with self._lock:
+            self._record_locked(failed=False)
+
+    def record_failure(self) -> None:
+        """Record a failed call in the current bucket."""
+        with self._lock:
+            self._record_locked(failed=True)
+
+    def reset(self) -> None:
+        """Forget every sample collected so far."""
+        with self._lock:
+            self._buckets.clear()
+
+    def snapshot(self) -> WindowStats:
+        """Return the stats for the window ending at the current time.
+
+        Only buckets still inside the window are counted, so samples recorded
+        before a long idle period do not influence the result.
+        """
+        with self._lock:
+            self._prune_locked(self._current_bucket_index())
+            sample_count = 0
+            failure_count = 0
+            for successes, failures in self._buckets.values():
+                sample_count += successes + failures
+                failure_count += failures
+        failure_rate = failure_count / sample_count if sample_count else 0.0
+        return WindowStats(sample_count, failure_count, failure_rate)
 
 
 class CircuitBreaker:
@@ -98,8 +183,21 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        failure_rate_threshold: float | None = None,
+        window_duration: float | None = None,
+        window_min_calls: int = 1,
+        time_func: Callable[[], float] | None = None,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        By default, the circuit opens after `fail_max` consecutive failures.
+        If `failure_rate_threshold` and `window_duration` are given instead,
+        the circuit opens when the failure rate over a sliding window of
+        `window_duration` seconds reaches `failure_rate_threshold`, provided
+        at least `window_min_calls` calls were seen in that window. `time_func`
+        is the monotonic clock driving the window and defaults to
+        `time.monotonic`.
+        """
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
@@ -107,6 +205,26 @@ class CircuitBreaker:
         self._fail_max = fail_max
         self._reset_timeout = reset_timeout
         self._success_threshold = success_threshold
+
+        if (failure_rate_threshold is None) != (window_duration is None):
+            msg = "failure_rate_threshold and window_duration must be set together"
+            raise ValueError(msg)
+        if failure_rate_threshold is not None and not 0 < failure_rate_threshold <= 1:
+            msg = "failure_rate_threshold must be in the (0, 1] interval"
+            raise ValueError(msg)
+        if window_duration is not None and window_duration <= 0:
+            msg = "window_duration must be greater than zero"
+            raise ValueError(msg)
+        if window_min_calls < 1:
+            msg = "window_min_calls must be at least 1"
+            raise ValueError(msg)
+
+        self._failure_rate_threshold = failure_rate_threshold
+        self._window_duration = window_duration
+        self._window_min_calls = window_min_calls
+        self._window: SlidingWindowMetrics | None = None
+        if window_duration is not None:
+            self._window = SlidingWindowMetrics(window_duration, clock=time_func or time.monotonic)
 
         self._excluded_exceptions = list(exclude or [])
         self._listeners = list(listeners or [])
@@ -116,8 +234,43 @@ class CircuitBreaker:
 
     @property
     def fail_counter(self) -> int:
-        """Return the current number of consecutive failures."""
+        """Return the current number of consecutive failures, or the number of
+        failures in the current window when the sliding window failure rate
+        strategy is in use.
+        """
+        if self._window is not None:
+            return self._window.snapshot().failure_count
         return self._state_storage.counter
+
+    @property
+    def window_stats(self) -> WindowStats | None:
+        """Return the stats of the sliding window, or None when the sliding
+        window failure rate strategy is not in use.
+        """
+        if self._window is None:
+            return None
+        return self._window.snapshot()
+
+    @property
+    def failure_rate_threshold(self) -> float | None:
+        """Return the failure rate that trips the circuit, or None when the
+        consecutive failure strategy is in use.
+        """
+        return self._failure_rate_threshold
+
+    @property
+    def window_duration(self) -> float | None:
+        """Return the length, in seconds, of the sliding window, or None when
+        the consecutive failure strategy is in use.
+        """
+        return self._window_duration
+
+    @property
+    def window_min_calls(self) -> int:
+        """Return the minimum number of calls in the sliding window before the
+        failure rate is evaluated.
+        """
+        return self._window_min_calls
 
     @property
     def success_counter(self) -> int:
@@ -226,7 +379,38 @@ class CircuitBreaker:
 
     def _inc_counter(self) -> None:
         """Increment the counter of failed calls."""
+        if self._window is not None:
+            self._window.record_failure()
+            return
         self._state_storage.increment_counter()
+
+    def _record_success(self) -> None:
+        """Record a successful call, resetting the consecutive failure counter
+        or feeding the sliding window, depending on the strategy in use.
+        """
+        if self._window is not None:
+            self._window.record_success()
+            return
+        self._state_storage.reset_counter()
+
+    def _reset_failure_tracking(self) -> None:
+        """Forget all previously seen failures, whichever strategy is in use."""
+        if self._window is not None:
+            self._window.reset()
+            return
+        self._state_storage.reset_counter()
+
+    def _should_open(self) -> bool:
+        """Return whether the circuit should open given the failures seen so far."""
+        if self._window is not None:
+            threshold = self._failure_rate_threshold
+            stats = self._window.snapshot()
+            return (
+                threshold is not None
+                and stats.sample_count >= self._window_min_calls
+                and stats.failure_rate >= threshold
+            )
+        return self._state_storage.counter >= self._fail_max
 
     def is_system_error(self, exception: ExceptionType) -> bool:
         """Return whether the exception `exception` is considered a signal of
@@ -694,14 +878,22 @@ class CircuitBreakerState:
                 listener.failure(self._breaker, exc)
             self.on_failure(exc)
         else:
-            self._handle_success()
+            self._handle_success(count_sample=False)
 
         if reraise:
             raise exc
 
-    def _handle_success(self) -> None:
-        """Handle a successful call to the guarded operation."""
-        self._breaker._state_storage.reset_counter()
+    def _handle_success(self, count_sample: bool = True) -> None:
+        """Handle a successful call to the guarded operation.
+
+        Excluded exceptions are handled with `count_sample=False`: they are
+        not system errors, so they must not count as samples in the sliding
+        window (neither in the numerator nor in the denominator).
+        """
+        if count_sample:
+            self._breaker._record_success()
+        elif self._breaker._window is None:
+            self._breaker._state_storage.reset_counter()
         self.on_success()
         for listener in self._breaker.listeners:
             listener.success(self._breaker)
@@ -800,13 +992,13 @@ class CircuitClosedState(CircuitBreakerState):
             # using the same _state_storage object, or if the _state_storage objects
             # share a central source of truth (as would be the case with the redis
             # storage).
-            self._breaker._state_storage.reset_counter()
+            self._breaker._reset_failure_tracking()
             for listener in self._breaker.listeners:
                 listener.state_change(self._breaker, prev_state, self)
 
     def on_failure(self, exc: BaseException) -> None:
         """Move the circuit breaker to the "open" state once the failures threshold is reached."""
-        if self._breaker._state_storage.counter >= self._breaker.fail_max:
+        if self._breaker._should_open():
             throw_new_error = self._breaker.open()
 
             if throw_new_error:
