@@ -292,6 +292,40 @@ a type:
 You may mix types and filter callables freely.
 
 
+Classifying Call Results
+````````````````````````
+
+By default, any call that does not raise is considered a success. Some APIs,
+however, signal failures in their return values (e.g. an HTTP response object
+with a 503 status). Pass a ``result_classifier`` callable to classify each
+call result as a success, a failure, or a result that should not be counted
+at all:
+
+.. code:: python
+
+    import pybreaker
+
+    def classify_response(response):
+        if response.status_code >= 500:
+            return pybreaker.RESULT_FAILURE
+        if response.status_code == 404:
+            return pybreaker.RESULT_IGNORE
+        return pybreaker.RESULT_SUCCESS
+
+    db_breaker = CircuitBreaker(result_classifier=classify_response)
+
+The classifier is called exactly once per call, and the original result is
+always returned to the caller unchanged. Results classified as failures
+follow the same state transitions as raised exceptions, including the
+``throw_new_error_on_trip`` behavior when the failure trips the breaker.
+Ignored results leave all counters untouched, so they never count as a
+successful half-open probe.
+
+If the classifier itself raises (or returns an invalid classification), a
+``pybreaker.ResultClassifierError`` is raised instead, without affecting the
+circuit breaker's counters or state.
+
+
 Monitoring and Management
 `````````````````````````
 
