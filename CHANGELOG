@@ -1,6 +1,11 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Add optional sliding-window failure-rate strategy while retaining consecutive-failure behavior
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

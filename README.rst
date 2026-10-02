@@ -80,7 +80,46 @@ requests before closing the circuit breaker:
   services if there's support at the API level.
 
 If you'd like to use the Redis backing, initialize the ``CircuitBreaker`` with
-a ``CircuitRedisStorage``:
+Sliding Failure Rate
+````````````````````
+
+The default strategy opens the circuit after a number of consecutive failures.
+For high-throughput integration points, you can instead open it based on the
+failure ratio during a recent sliding window:
+
+.. code:: python
+
+    db_breaker = pybreaker.CircuitBreaker(
+        reset_timeout=30,
+        failure_window=60,
+        min_samples=20,
+        failure_rate_threshold=0.5,
+    )
+
+This example ignores the failure ratio until at least 20 calls were recorded in
+the previous 60 seconds. After that sample count is reached, the circuit opens
+when at least 50% of the recorded calls failed. Successful and failed calls are
+both counted as samples; exceptions listed in ``exclude`` are neither failures
+nor denominator samples.
+
+The window advances using a monotonic clock, so failures expire after a period
+without calls. Calls rejected while the circuit is open are not recorded as new
+outcomes. Manually closing the circuit, or automatically closing it after a
+successful half-open trial, starts the next closed period with an empty failure
+window.
+
+Current window data is available from ``failure_window_stats``:
+
+.. code:: python
+
+    stats = db_breaker.failure_window_stats
+    print(stats.sample_count, stats.failure_count, stats.success_count, stats.failure_rate)
+
+The failure-rate samples are maintained in local memory; the Redis storage still
+holds the breaker state and consecutive-failure counters.
+
+If you'd like to use the Redis backing, initialize the ``CircuitBreaker`` with a
+``CircuitRedisStorage``:
 
 .. code:: python
 
@@ -305,6 +344,9 @@ change its current state:
 
     # Get the current number of consecutive successes
     print(db_breaker.success_counter)
+
+    # Get sliding failure-rate statistics when that strategy is configured
+    print(db_breaker.failure_window_stats)
 
     # Get/set the maximum number of consecutive failures
     print(db_breaker.fail_max)

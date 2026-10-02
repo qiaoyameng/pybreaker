@@ -10,11 +10,14 @@ from __future__ import annotations
 import calendar
 import contextlib
 import logging
+import math
 import sys
 import threading
 import time
 import types
 from abc import abstractmethod
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import (
@@ -61,6 +64,7 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "FailureWindowStats",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
     "STATE_OPEN",
@@ -76,6 +80,120 @@ T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
 CBListenerType = TypeVar("CBListenerType", bound="CircuitBreakerListener")
 CBStateType = Union["CircuitClosedState", "CircuitHalfOpenState", "CircuitOpenState"]
+
+
+@dataclass(frozen=True)
+class FailureWindowStats:
+    """Describe the calls observed by a sliding failure-rate window."""
+
+    sample_count: int
+    failure_count: int
+    success_count: int
+
+    @property
+    def failure_rate(self) -> float:
+        """Return the failed fraction of observed calls, or zero if there are no samples."""
+        if self.sample_count == 0:
+            return 0.0
+        return self.failure_count / self.sample_count
+
+
+class SlidingFailureWindow:
+    """Track successful and failed calls over a monotonic, time-based window."""
+
+    def __init__(
+        self,
+        window_length: float,
+        min_sample_count: int,
+        failure_rate_threshold: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.window_length = window_length
+        self.min_sample_count = min_sample_count
+        self.failure_rate_threshold = failure_rate_threshold
+        self._clock = clock
+        self._samples: deque[tuple[float, bool]] = deque()
+        self._failure_count = 0
+        self._success_count = 0
+        self._latest_timestamp: float | None = None
+
+    def _now(self) -> float:
+        now = self._clock()
+        if self._latest_timestamp is not None and now < self._latest_timestamp:
+            now = self._latest_timestamp
+        self._latest_timestamp = now
+        return now
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_length
+        if not self._samples:
+            return
+        if self._samples[-1][0] <= cutoff:
+            self._samples.clear()
+            self._failure_count = 0
+            self._success_count = 0
+            return
+        while self._samples and self._samples[0][0] <= cutoff:
+            _, failed = self._samples.popleft()
+            if failed:
+                self._failure_count -= 1
+            else:
+                self._success_count -= 1
+
+    def _stats(self) -> FailureWindowStats:
+        return FailureWindowStats(
+            sample_count=self._failure_count + self._success_count,
+            failure_count=self._failure_count,
+            success_count=self._success_count,
+        )
+
+    def record(self, failed: bool) -> FailureWindowStats:
+        """Record one call outcome and return the stats for its timestamp."""
+        now = self._now()
+        self._prune(now)
+        self._samples.append((now, failed))
+        if failed:
+            self._failure_count += 1
+        else:
+            self._success_count += 1
+        return self._stats()
+
+    def stats(self) -> FailureWindowStats:
+        """Prune expired samples and return current window statistics."""
+        now = self._clock()
+        if self._latest_timestamp is not None and now < self._latest_timestamp:
+            now = self._latest_timestamp
+        self._prune(now)
+        return self._stats()
+
+    def reset(self) -> None:
+        """Remove every observed call from the window."""
+        self._samples.clear()
+        self._failure_count = 0
+        self._success_count = 0
+
+    def should_open(self, stats: FailureWindowStats) -> bool:
+        """Return whether stats meet the sample count and failure-rate thresholds."""
+        return (
+            stats.sample_count >= self.min_sample_count
+            and stats.failure_rate >= self.failure_rate_threshold
+        )
+
+
+def _validate_failure_window_config(
+    window_length: float,
+    min_sample_count: int,
+    failure_rate_threshold: float,
+) -> None:
+    if not math.isfinite(window_length) or window_length <= 0:
+        message = "failure_window must be a positive, finite number of seconds"
+        raise ValueError(message)
+    if not isinstance(min_sample_count, int) or isinstance(min_sample_count, bool) or min_sample_count < 1:
+        message = "min_samples must be a positive integer"
+        raise ValueError(message)
+    if not math.isfinite(failure_rate_threshold) or not 0 < failure_rate_threshold <= 1:
+        message = "failure_rate_threshold must be greater than 0 and less than or equal to 1"
+        raise ValueError(message)
 
 
 class CircuitBreaker:
@@ -98,6 +216,12 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        *,
+        failure_window: float | None = None,
+        min_samples: int | None = None,
+        failure_rate_threshold: float | None = None,
+        time_func: Callable[[], float] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         """Create a new circuit breaker with the given parameters."""
         self._lock = threading.RLock()
@@ -113,6 +237,102 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+
+        config_values = (failure_window, min_samples, failure_rate_threshold)
+        if any(value is not None for value in config_values) and not all(
+            value is not None for value in config_values
+        ):
+            message = "failure_window, min_samples, and failure_rate_threshold must be configured together"
+            raise ValueError(message)
+
+        self._failure_window: SlidingFailureWindow | None = None
+        self._last_failure_window_stats: FailureWindowStats | None = None
+        if failure_window is not None and min_samples is not None and failure_rate_threshold is not None:
+            _validate_failure_window_config(failure_window, min_samples, failure_rate_threshold)
+            if time_func is not None and clock is not None:
+                message = "time_func and clock are aliases and cannot both be provided"
+                raise ValueError(message)
+            clock = time_func if time_func is not None else clock
+            if clock is not None and not callable(clock):
+                message = "clock must be a callable that returns monotonic seconds"
+                raise ValueError(message)
+            self._failure_window = SlidingFailureWindow(
+                failure_window,
+                min_samples,
+                failure_rate_threshold,
+                clock if clock is not None else time.monotonic,
+            )
+
+    @property
+    def failure_window(self) -> float | None:
+        """Return the sliding failure-rate window length in seconds."""
+        if self._failure_window is None:
+            return None
+        return self._failure_window.window_length
+
+    @failure_window.setter
+    def failure_window(self, window_length: float) -> None:
+        """Set the sliding failure-rate window length in seconds."""
+        if self._failure_window is None:
+            message = "failure window strategy is not configured"
+            raise ValueError(message)
+        _validate_failure_window_config(
+            window_length,
+            self._failure_window.min_sample_count,
+            self._failure_window.failure_rate_threshold,
+        )
+        with self._lock:
+            self._failure_window.window_length = window_length
+
+    @property
+    def min_samples(self) -> int | None:
+        """Return the minimum number of samples required before rate-based tripping."""
+        if self._failure_window is None:
+            return None
+        return self._failure_window.min_sample_count
+
+    @min_samples.setter
+    def min_samples(self, number: int) -> None:
+        """Set the minimum number of samples required before rate-based tripping."""
+        if self._failure_window is None:
+            message = "failure window strategy is not configured"
+            raise ValueError(message)
+        _validate_failure_window_config(
+            self._failure_window.window_length,
+            number,
+            self._failure_window.failure_rate_threshold,
+        )
+        with self._lock:
+            self._failure_window.min_sample_count = number
+
+    @property
+    def failure_rate_threshold(self) -> float | None:
+        """Return the failure rate that opens the circuit when minimum samples are present."""
+        if self._failure_window is None:
+            return None
+        return self._failure_window.failure_rate_threshold
+
+    @failure_rate_threshold.setter
+    def failure_rate_threshold(self, rate: float) -> None:
+        """Set the failure rate that opens the circuit when minimum samples are present."""
+        if self._failure_window is None:
+            message = "failure window strategy is not configured"
+            raise ValueError(message)
+        _validate_failure_window_config(
+            self._failure_window.window_length,
+            self._failure_window.min_sample_count,
+            rate,
+        )
+        with self._lock:
+            self._failure_window.failure_rate_threshold = rate
+
+    @property
+    def failure_window_stats(self) -> FailureWindowStats | None:
+        """Return current sliding-window statistics, or None when rate strategy is disabled."""
+        if self._failure_window is None:
+            return None
+        with self._lock:
+            return self._failure_window.stats()
 
     @property
     def fail_counter(self) -> int:
@@ -226,7 +446,37 @@ class CircuitBreaker:
 
     def _inc_counter(self) -> None:
         """Increment the counter of failed calls."""
-        self._state_storage.increment_counter()
+        if self._failure_window is not None:
+            self._last_failure_window_stats = self._failure_window.record(failed=True)
+        else:
+            self._state_storage.increment_counter()
+
+    def _record_success(self) -> None:
+        """Record a successful or excluded call using the active failure strategy."""
+        if self._failure_window is not None:
+            self._last_failure_window_stats = self._failure_window.record(failed=False)
+        else:
+            self._state_storage.reset_counter()
+
+    def _record_excluded_error(self) -> None:
+        """Preserve consecutive-strategy behavior without adding an excluded call to rate stats."""
+        if self._failure_window is None:
+            self._state_storage.reset_counter()
+
+    def _reset_failures(self) -> None:
+        """Clear the failure data maintained by the active failure strategy."""
+        self._state_storage.reset_counter()
+        if self._failure_window is not None:
+            self._failure_window.reset()
+        self._last_failure_window_stats = None
+
+    def _failure_threshold_reached(self) -> bool:
+        """Return whether the active failure strategy has reached its opening threshold."""
+        if self._failure_window is None:
+            return self._state_storage.counter >= self._fail_max
+        stats = self._last_failure_window_stats or self._failure_window.stats()
+        self._last_failure_window_stats = stats
+        return self._failure_window.should_open(stats)
 
     def is_system_error(self, exception: ExceptionType) -> bool:
         """Return whether the exception `exception` is considered a signal of
@@ -298,6 +548,7 @@ class CircuitBreaker:
         """Close the circuit, e.g. lets the following calls execute as usual."""
         with self._lock:
             self._state_storage.reset_success_counter()  # Reset success counter when closing
+            self._reset_failures()
             self.state = self._state_storage.state = STATE_CLOSED  # type: ignore[assignment]
 
     def __call__(self, *call_args: Any, **call_kwargs: bool) -> Callable:
@@ -694,14 +945,17 @@ class CircuitBreakerState:
                 listener.failure(self._breaker, exc)
             self.on_failure(exc)
         else:
-            self._handle_success()
+            self._breaker._record_excluded_error()
+            self.on_excluded()
+            for listener in self._breaker.listeners:
+                listener.success(self._breaker)
 
         if reraise:
             raise exc
 
     def _handle_success(self) -> None:
         """Handle a successful call to the guarded operation."""
-        self._breaker._state_storage.reset_counter()
+        self._breaker._record_success()
         self.on_success()
         for listener in self._breaker.listeners:
             listener.success(self._breaker)
@@ -773,6 +1027,9 @@ class CircuitBreakerState:
     def on_success(self) -> None:
         """Override this method to be notified when a call to the guarded operation succeeds."""
 
+    def on_excluded(self) -> None:
+        """Handle a call that raised an exception excluded from failure accounting."""
+
     def on_failure(self, exc: BaseException) -> None:
         """Override this method to be notified when a call to the guarded operation fails."""
 
@@ -800,19 +1057,24 @@ class CircuitClosedState(CircuitBreakerState):
             # using the same _state_storage object, or if the _state_storage objects
             # share a central source of truth (as would be the case with the redis
             # storage).
-            self._breaker._state_storage.reset_counter()
+            self._breaker._reset_failures()
             for listener in self._breaker.listeners:
                 listener.state_change(self._breaker, prev_state, self)
 
     def on_failure(self, exc: BaseException) -> None:
         """Move the circuit breaker to the "open" state once the failures threshold is reached."""
-        if self._breaker._state_storage.counter >= self._breaker.fail_max:
+        if self._breaker._failure_threshold_reached():
             throw_new_error = self._breaker.open()
 
             if throw_new_error:
                 error_msg = "Failures threshold reached, circuit breaker opened"
                 raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
             raise exc
+
+    def on_success(self) -> None:
+        """Open the circuit when a sliding failure-rate strategy remains above threshold."""
+        if self._breaker._failure_threshold_reached():
+            self._breaker.open()
 
 
 class CircuitOpenState(CircuitBreakerState):
@@ -895,6 +1157,10 @@ class CircuitHalfOpenState(CircuitBreakerState):
 
         if self._breaker._state_storage.success_counter >= self._breaker.success_threshold:
             self._breaker.close()
+
+    def on_excluded(self) -> None:
+        """Preserve the existing treatment of excluded exceptions as successful trials."""
+        self.on_success()
 
 
 class CircuitBreakerError(Exception):

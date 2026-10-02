@@ -1352,5 +1352,301 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         assert breaker.current_state == "closed"
 
 
+class FakeClock:
+    def __init__(self, value=0.0):
+        self.value = float(value)
+
+    def __call__(self):
+        return self.value
+
+
+class CircuitBreakerSlidingFailureWindowTestCase(unittest.TestCase):
+    def test_time_func_is_supported_as_fake_clock_alias(self):
+        breaker = CircuitBreaker(
+            failure_window=10,
+            min_samples=1,
+            failure_rate_threshold=1.0,
+            time_func=FakeClock(7),
+        )
+
+        assert breaker.failure_window == 10
+        assert breaker.min_samples == 1
+        assert breaker.failure_rate_threshold == 1.0
+
+        def fail():
+            raise RuntimeError
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        assert breaker.current_state == STATE_OPEN
+
+    def test_invalid_window_configuration_is_rejected(self):
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_window=0, min_samples=1, failure_rate_threshold=1.0)
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_window=10, min_samples=0, failure_rate_threshold=1.0)
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_window=10, min_samples=1, failure_rate_threshold=0)
+        with pytest.raises(ValueError):
+            CircuitBreaker(failure_window=10, min_samples=1)
+
+    def test_uses_a_monotonic_window_boundary_for_every_decision(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            failure_window=10,
+            min_samples=3,
+            failure_rate_threshold=0.5,
+            clock=clock,
+        )
+
+        def succeed():
+            return True
+
+        def fail():
+            raise RuntimeError
+
+        with pytest.raises(RuntimeError):
+            breaker.call(fail)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count, stats.failure_rate) == (
+            1,
+            1,
+            0,
+            1.0,
+        )
+        assert breaker.current_state == STATE_CLOSED
+
+        clock.value = 9
+        assert breaker.call(succeed)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count, stats.failure_rate) == (
+            2,
+            1,
+            1,
+            0.5,
+        )
+        assert breaker.current_state == STATE_CLOSED
+
+        clock.value = 10
+        with pytest.raises(RuntimeError):
+            breaker.call(fail)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count, stats.failure_rate) == (
+            2,
+            1,
+            1,
+            0.5,
+        )
+        assert breaker.current_state == STATE_CLOSED
+
+        assert breaker.call(succeed)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count, stats.failure_rate) == (
+            3,
+            1,
+            2,
+            1 / 3,
+        )
+        assert breaker.current_state == STATE_CLOSED
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count, stats.failure_rate) == (
+            4,
+            2,
+            2,
+            0.5,
+        )
+        assert breaker.current_state == STATE_OPEN
+
+    def test_old_failures_expire_after_idle_before_a_new_decision(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            failure_window=5,
+            min_samples=2,
+            failure_rate_threshold=1.0,
+            clock=clock,
+        )
+
+        def fail():
+            raise RuntimeError
+
+        with pytest.raises(RuntimeError):
+            breaker.call(fail)
+        assert breaker.failure_window_stats.sample_count == 1
+        assert breaker.current_state == STATE_CLOSED
+
+        clock.value = 100
+        with pytest.raises(RuntimeError):
+            breaker.call(fail)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (1, 1, 0)
+        assert stats.failure_rate == 1.0
+        assert breaker.current_state == STATE_CLOSED
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count) == (2, 2)
+        assert breaker.current_state == STATE_OPEN
+
+    def test_large_clock_jump_does_not_keep_old_samples(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            failure_window=1,
+            min_samples=2,
+            failure_rate_threshold=1.0,
+            clock=clock,
+        )
+
+        def succeed():
+            return True
+
+        def fail():
+            raise RuntimeError
+
+        with pytest.raises(RuntimeError):
+            breaker.call(fail)
+        clock.value = 1_000_000_000
+        assert breaker.call(succeed)
+
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (1, 0, 1)
+        assert breaker.current_state == STATE_CLOSED
+
+    def test_excluded_exceptions_are_not_window_samples(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            failure_window=10,
+            min_samples=3,
+            failure_rate_threshold=0.75,
+            exclude=[LookupError],
+            clock=clock,
+        )
+
+        def succeed():
+            return True
+
+        def fail():
+            raise RuntimeError
+
+        def excluded():
+            raise KeyError
+
+        with pytest.raises(RuntimeError):
+            breaker.call(fail)
+        with pytest.raises(KeyError):
+            breaker.call(excluded)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (1, 1, 0)
+
+        assert breaker.call(succeed)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (2, 1, 1)
+
+        with pytest.raises(RuntimeError):
+            breaker.call(fail)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (3, 2, 1)
+        assert breaker.current_state == STATE_CLOSED
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (4, 3, 1)
+        assert stats.failure_rate == 0.75
+        assert breaker.current_state == STATE_OPEN
+
+    def test_manual_close_uses_the_same_window_reset_as_statistics(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            failure_window=10,
+            min_samples=1,
+            failure_rate_threshold=1.0,
+            clock=clock,
+        )
+
+        def succeed():
+            return True
+
+        def fail():
+            raise RuntimeError
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        assert breaker.current_state == STATE_OPEN
+
+        breaker.close()
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count, stats.failure_rate) == (
+            0,
+            0,
+            0,
+            0.0,
+        )
+        assert breaker.current_state == STATE_CLOSED
+
+        assert breaker.call(succeed)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (1, 0, 1)
+
+    def test_half_open_success_clears_the_window_on_close(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            failure_window=10,
+            min_samples=1,
+            failure_rate_threshold=1.0,
+            clock=clock,
+        )
+
+        def succeed():
+            return True
+
+        def fail():
+            raise RuntimeError
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        assert breaker.current_state == STATE_OPEN
+
+        breaker.half_open()
+        assert breaker.call(succeed)
+        assert breaker.current_state == STATE_CLOSED
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (0, 0, 0)
+
+    def test_half_open_failure_does_not_become_closed_window_history(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            failure_window=10,
+            min_samples=1,
+            failure_rate_threshold=1.0,
+            clock=clock,
+        )
+
+        def succeed():
+            return True
+
+        def fail():
+            raise RuntimeError
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        breaker.half_open()
+
+        clock.value = 1
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(fail)
+        assert breaker.current_state == STATE_OPEN
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (2, 2, 0)
+
+        breaker.close()
+        assert breaker.call(succeed)
+        stats = breaker.failure_window_stats
+        assert (stats.sample_count, stats.failure_count, stats.success_count) == (1, 0, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
