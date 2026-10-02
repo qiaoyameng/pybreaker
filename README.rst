@@ -73,6 +73,27 @@ requests before closing the circuit breaker:
     # Require 3 successful requests before closing
     db_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60, success_threshold=3)
 
+When the reset timeout elapses, many threads may try to probe the failing
+operation at once. To limit this burst, the half-open state admits at most
+``half_open_max_concurrent`` concurrent probe calls (1 by default); calls that
+cannot get a probe permit are rejected immediately with
+``CircuitBreakerHalfOpenError`` (a subclass of ``CircuitBreakerError``):
+
+.. code:: python
+
+    # Allow up to 3 concurrent probe calls while half-open
+    db_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60, half_open_max_concurrent=3)
+
+Each probe belongs to the half-open round in which it started. If a probe
+fails and the circuit reopens, late completions from the previous round can
+no longer change the new state. Only completions of the current round count
+towards ``success_threshold``: successful probes (including calls that raise
+excluded exceptions, which are treated as successes) increment the success
+counter, while cancellations, rejected calls, and stale completions from
+previous rounds do not. Probe permits are always returned, including when a
+probe is cancelled, raises an excluded exception, or the circuit is manually
+opened or closed.
+
 .. note::
 
   Integration points to external services (i.e. databases, queues, etc) are
@@ -313,6 +334,14 @@ change its current state:
     # Get/set the success threshold
     print(db_breaker.success_threshold)
     db_breaker.success_threshold = 3
+
+    # Get/set the maximum number of concurrent half-open probe calls
+    print(db_breaker.half_open_max_concurrent)
+    db_breaker.half_open_max_concurrent = 3
+
+    # Get the number of probe calls that may still be admitted in the
+    # current half-open round
+    print(db_breaker.half_open_permits)
 
     # Get/set the current reset timeout period (in seconds)
     print(db_breaker.reset_timeout)

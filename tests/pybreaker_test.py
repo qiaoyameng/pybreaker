@@ -1315,6 +1315,201 @@ class CircuitBreakerRedisConcurrencyTestCase(unittest.TestCase):
         assert self.breaker.fail_counter < self.breaker.fail_max + num_threads
 
 
+class CircuitBreakerHalfOpenProbeTestCase(unittest.TestCase):
+    """Tests for half-open probe permits and round (epoch) handling."""
+
+    def test_default_single_probe_permit(self):
+        """CircuitBreaker: it should allow a single concurrent probe by default."""
+        breaker = CircuitBreaker()
+        assert breaker.half_open_max_concurrent == 1
+
+        breaker.half_open()
+        assert breaker.half_open_permits == 1
+
+    def test_probe_rejected_when_permits_exhausted(self):
+        """CircuitBreaker: it should reject calls immediately with an
+        identifiable error when all half-open probe permits are taken."""
+        breaker = CircuitBreaker(half_open_max_concurrent=1)
+        breaker.half_open()
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def probe():
+            entered.set()
+            release.wait(5)
+            return True
+
+        thread = threading.Thread(target=lambda: breaker.call(probe))
+        thread.start()
+        assert entered.wait(5)
+        assert breaker.half_open_permits == 0
+
+        def should_not_run():
+            pytest.fail("call should have been rejected without a probe permit")
+
+        with pytest.raises(CircuitBreakerHalfOpenError) as exc_info:
+            breaker.call(should_not_run)
+        assert isinstance(exc_info.value, CircuitBreakerError)
+
+        release.set()
+        thread.join(5)
+        assert breaker.current_state == "closed"
+        assert breaker.half_open_permits == 1
+
+    def test_excluded_exception_releases_probe_permit(self):
+        """CircuitBreaker: it should return the probe permit when the probe
+        raises an excluded exception, which counts as a success."""
+        breaker = CircuitBreaker(success_threshold=2, exclude=[LookupError])
+        breaker.half_open()
+
+        def err():
+            raise LookupError
+
+        with pytest.raises(LookupError):
+            breaker.call(err)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 1
+        assert breaker.half_open_permits == 1
+
+    def test_cancelled_probe_releases_permit_without_counting(self):
+        """CircuitBreaker: it should return the probe permit when the probe is
+        cancelled, without counting the cancellation as failure or success."""
+        import asyncio
+
+        breaker = CircuitBreaker()
+        breaker.half_open()
+
+        def cancelled():
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            breaker.call(cancelled)
+        assert breaker.current_state == "half-open"
+        assert breaker.fail_counter == 0
+        assert breaker.success_counter == 0
+        assert breaker.half_open_permits == 1
+
+    def test_manual_open_close_returns_probe_permits(self):
+        """CircuitBreaker: it should return all probe permits when the user
+        manually opens or closes the circuit."""
+        breaker = CircuitBreaker(half_open_max_concurrent=2)
+        breaker.half_open()
+
+        inside = threading.Barrier(3)
+        release = threading.Event()
+
+        def probe():
+            inside.wait()
+            release.wait(5)
+            return True
+
+        threads = [threading.Thread(target=lambda: breaker.call(probe)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+
+        inside.wait()
+        assert breaker.half_open_permits == 0
+
+        breaker.open()
+        assert breaker.half_open_permits == 2
+
+        breaker.half_open()
+        assert breaker.half_open_permits == 2
+
+        breaker.close()
+        assert breaker.half_open_permits == 2
+
+        release.set()
+        for thread in threads:
+            thread.join(5)
+
+        # The stale successes from the previous rounds must not be recorded.
+        assert breaker.current_state == "closed"
+        assert breaker.success_counter == 0
+
+    def test_probe_completion_order_with_manual_new_round(self):
+        """CircuitBreaker: it should ignore late successes from a previous
+        half-open round after a failed probe reopened the circuit and a new
+        round was started manually."""
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=60, success_threshold=2, half_open_max_concurrent=3)
+        breaker.open()
+        breaker.half_open()
+
+        entered = []
+        inside = threading.Barrier(4)
+        gates = [threading.Event() for _ in range(3)]
+        results = [None] * 3
+
+        def make_probe(index, fail):
+            def probe():
+                entered.append(index)
+                inside.wait()
+                gates[index].wait(5)
+                if fail:
+                    raise RuntimeError("probe failure")
+                return True
+
+            return probe
+
+        def run_probe(index):
+            try:
+                breaker.call(make_probe(index, fail=index == 0))
+            except Exception as exc:
+                results[index] = exc
+            else:
+                results[index] = "returned"
+
+        threads = [threading.Thread(target=run_probe, args=(i,)) for i in range(3)]
+        for thread in threads:
+            thread.start()
+
+        # All three probes are admitted and running; no permits are left.
+        inside.wait()
+        assert breaker.half_open_permits == 0
+
+        # A fourth call is rejected immediately without entering the function.
+        def rejected():
+            entered.append("rejected")
+
+        with pytest.raises(CircuitBreakerHalfOpenError):
+            breaker.call(rejected)
+
+        # The first probe completes with a failure: the circuit reopens.
+        gates[0].set()
+        threads[0].join(5)
+        assert breaker.current_state == "open"
+        assert isinstance(results[0], CircuitBreakerError)
+
+        # Manually start a new half-open round.
+        breaker.half_open()
+        assert breaker.current_state == "half-open"
+        assert breaker.half_open_permits == 3
+
+        # The remaining probes from the old round complete successfully, late.
+        gates[1].set()
+        gates[2].set()
+        threads[1].join(5)
+        threads[2].join(5)
+
+        # Their stale successes must not close the circuit nor be counted.
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 0
+        assert breaker.half_open_permits == 3
+        assert len(entered) == 3
+
+        # A fresh probe in the current round is admitted and counted.
+        def new_probe():
+            entered.append("new")
+            return True
+
+        assert breaker.call(new_probe)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 1
+        assert breaker.half_open_permits == 3
+        assert len(entered) == 4
+
+
 class CircuitBreakerContextManagerTestCase(unittest.TestCase):
     """Tests for the CircuitBreaker class, when used as a context manager."""
 

@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Unreleased
+
+* Add half_open_max_concurrent parameter limiting concurrent half-open probe
+  calls; calls without a probe permit are rejected with the new
+  CircuitBreakerHalfOpenError (a CircuitBreakerError subclass)
+* Stop holding the circuit breaker lock while the guarded function runs; probe
+  completions are bound to their half-open round so late successes from a
+  previous round cannot close a reopened circuit
+* Cancellations and other non-Exception interruptions no longer count as
+  failures or successes; they (like excluded exceptions and manual
+  open/close) always return the probe permit
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
