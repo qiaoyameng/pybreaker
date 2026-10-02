@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import logging
+import queue
 import sys
 import threading
 import time
@@ -22,6 +23,7 @@ from typing import (
     Any,
     Callable,
     Literal,
+    NamedTuple,
     NoReturn,
     TypeVar,
     Union,
@@ -61,6 +63,7 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerNotifier",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
     "STATE_OPEN",
@@ -98,6 +101,7 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        notifier: CircuitBreakerNotifier | None = None,
     ) -> None:
         """Create a new circuit breaker with the given parameters."""
         self._lock = threading.RLock()
@@ -113,6 +117,7 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+        self._notifier = notifier
 
     @property
     def fail_counter(self) -> int:
@@ -345,6 +350,32 @@ class CircuitBreaker:
         """Unregister a listener of this circuit breaker."""
         with self._lock:
             self._listeners.remove(listener)  # type: ignore[arg-type]
+
+    @property
+    def notifier(self) -> CircuitBreakerNotifier | None:
+        """Return the notifier that dispatches state-change events, or `None`
+        if listeners are notified synchronously.
+        """
+        return self._notifier
+
+    def _notify_state_change(
+        self,
+        old_state: CircuitBreakerState | None,
+        new_state: CircuitBreakerState,
+    ) -> None:
+        """Deliver a committed state change to the listeners registered at
+        this moment.
+
+        When a notifier is configured, the event is queued for serialized
+        delivery outside of the state lock; otherwise, listeners are notified
+        synchronously.
+        """
+        listeners = tuple(self._listeners)
+        if self._notifier is not None:
+            self._notifier.submit(self, old_state, new_state, listeners)
+            return
+        for listener in listeners:
+            listener.state_change(self, old_state, new_state)
 
     @property
     def name(self) -> str | None:
@@ -665,6 +696,114 @@ class CircuitBreakerListener:
         """This callback function is called when the state of the circuit breaker `cb` state changes."""
 
 
+class _StateChangeNotification(NamedTuple):
+    """A committed state change queued for asynchronous delivery."""
+
+    cb: CircuitBreaker
+    old_state: CircuitBreakerState | None
+    new_state: CircuitBreakerState
+    listeners: tuple[CircuitBreakerListener, ...]
+
+
+class CircuitBreakerNotifier:
+    """Serialize state-change notifications on a dedicated background thread.
+
+    State transitions are committed synchronously under the circuit breaker's
+    lock; the listener callbacks are then delivered by this notifier, outside
+    of the state lock, in the order the transitions were committed. Each event
+    is delivered to a snapshot of the listeners taken when the transition was
+    committed, so adding or removing listeners only affects subsequent events.
+
+    Because delivery is serialized, a listener may safely trigger new state
+    transitions (e.g. by calling ``CircuitBreaker.close``): the resulting
+    events are queued behind the notification currently being delivered
+    instead of being dispatched reentrantly. A failing listener never rolls
+    back the committed state nor prevents the remaining listeners from being
+    notified; failures are reported through the configured error handler.
+    """
+
+    logger = logging.getLogger(__name__)
+
+    def __init__(
+        self,
+        error_handler: Callable[[CircuitBreaker, CircuitBreakerListener, BaseException], None] | None = None,
+        thread_name: str = "pybreaker-notifier",
+    ) -> None:
+        """Create a notifier and start its dispatcher thread. Listener
+        failures are reported to `error_handler`, or logged when no handler
+        is given.
+        """
+        self._error_handler = error_handler
+        self._queue: queue.Queue[_StateChangeNotification | None] = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._thread = threading.Thread(target=self._dispatch, name=thread_name, daemon=True)
+        self._thread.start()
+
+    def submit(
+        self,
+        cb: CircuitBreaker,
+        old_state: CircuitBreakerState | None,
+        new_state: CircuitBreakerState,
+        listeners: tuple[CircuitBreakerListener, ...],
+    ) -> None:
+        """Accept a committed state change for serialized delivery to the
+        given listener snapshot. Events are delivered in submission order.
+        """
+        with self._lock:
+            if self._closed:
+                msg = "CircuitBreakerNotifier is closed"
+                raise RuntimeError(msg)
+            self._queue.put(_StateChangeNotification(cb, old_state, new_state, listeners))
+
+    def flush(self) -> None:
+        """Block until every event accepted so far has been fully delivered."""
+        self._queue.join()
+
+    def close(self, wait: bool = True) -> None:
+        """Stop the dispatcher thread. When `wait` is true, block until all
+        previously accepted events have been delivered.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._queue.put(None)
+        if wait and threading.current_thread() is not self._thread:
+            self._thread.join()
+
+    def __enter__(self) -> CircuitBreakerNotifier:
+        """Return this notifier, to be closed when the `with` block exits."""
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        """Close this notifier, waiting for accepted events to be delivered."""
+        self.close()
+
+    def _dispatch(self) -> None:
+        while True:
+            event = self._queue.get()
+            try:
+                if event is None:
+                    return
+                for listener in event.listeners:
+                    try:
+                        listener.state_change(event.cb, event.old_state, event.new_state)
+                    except Exception as exc:
+                        self._report_error(event.cb, listener, exc)
+            finally:
+                self._queue.task_done()
+
+    def _report_error(self, cb: CircuitBreaker, listener: CircuitBreakerListener, exc: BaseException) -> None:
+        if self._error_handler is None:
+            self.logger.exception("Listener %r failed on state change of %r", listener, cb.name)
+            return
+        try:
+            self._error_handler(cb, listener, exc)
+        except Exception:
+            self.logger.exception("Error handler %r failed", self._error_handler)
+
+
 class CircuitBreakerState:
     """Implement the behavior needed by all circuit breaker states."""
 
@@ -801,8 +940,7 @@ class CircuitClosedState(CircuitBreakerState):
             # share a central source of truth (as would be the case with the redis
             # storage).
             self._breaker._state_storage.reset_counter()
-            for listener in self._breaker.listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify_state_change(prev_state, self)
 
     def on_failure(self, exc: BaseException) -> None:
         """Move the circuit breaker to the "open" state once the failures threshold is reached."""
@@ -835,8 +973,7 @@ class CircuitOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when opening the circuit
             self._breaker._state_storage.reset_success_counter()
-            for listener in self._breaker.listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify_state_change(prev_state, self)
 
     def before_call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """After the timeout elapses, move the circuit breaker to the "half-open"
@@ -877,8 +1014,7 @@ class CircuitHalfOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when entering half-open state
             self._breaker._state_storage.reset_success_counter()
-            for listener in self._breaker._listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify_state_change(prev_state, self)
 
     def on_failure(self, exc: BaseException) -> NoReturn:
         """Opens the circuit breaker."""
