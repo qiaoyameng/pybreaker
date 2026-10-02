@@ -59,10 +59,15 @@ except ImportError:
 
 __all__ = (
     "CircuitBreaker",
+    "CircuitBreakerClassifierError",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerResultFailure",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
+    "RESULT_FAILURE",
+    "RESULT_IGNORE",
+    "RESULT_SUCCESS",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
@@ -71,6 +76,13 @@ __all__ = (
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
+
+# Classifications a result classifier may return for a call result.
+RESULT_SUCCESS = "success"
+RESULT_FAILURE = "failure"
+RESULT_IGNORE = "ignore"
+
+_RESULT_CLASSIFICATIONS = frozenset((RESULT_SUCCESS, RESULT_FAILURE, RESULT_IGNORE))
 
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
@@ -98,6 +110,7 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        result_classifier: Callable[[Any], str] | None = None,
     ) -> None:
         """Create a new circuit breaker with the given parameters."""
         self._lock = threading.RLock()
@@ -113,6 +126,7 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+        self._result_classifier = result_classifier
 
     @property
     def fail_counter(self) -> int:
@@ -209,6 +223,13 @@ class CircuitBreaker:
         """
         return tuple(self._excluded_exceptions)
 
+    @property
+    def result_classifier(self) -> Callable[[Any], str] | None:
+        """Return the optional classifier used to classify the result of a
+        call as ``RESULT_SUCCESS``, ``RESULT_FAILURE`` or ``RESULT_IGNORE``.
+        """
+        return self._result_classifier
+
     def add_excluded_exception(self, exception: type[ExceptionType]) -> None:
         """Add an exception to the list of excluded exceptions."""
         with self._lock:
@@ -242,6 +263,29 @@ class CircuitBreaker:
                 if exclusion(exception):
                     return False
         return True
+
+    def _classify_result(self, result: Any) -> str:
+        """Classify the `result` of a call using the configured result
+        classifier, returning one of ``RESULT_SUCCESS``, ``RESULT_FAILURE``
+        or ``RESULT_IGNORE``. Calls without a classifier are always
+        considered successful.
+
+        A classifier that raises or returns an invalid classification is
+        reported as a ``CircuitBreakerClassifierError`` and never counted
+        as a success or failure of the guarded operation.
+        """
+        classifier = self._result_classifier
+        if classifier is None:
+            return RESULT_SUCCESS
+        try:
+            classification = classifier(result)
+        except BaseException as exc:
+            msg = "Result classifier {!r} raised an exception"
+            raise CircuitBreakerClassifierError(msg.format(classifier)) from exc
+        if classification not in _RESULT_CLASSIFICATIONS:
+            msg = "Result classifier {!r} returned invalid classification {!r}"
+            raise CircuitBreakerClassifierError(msg.format(classifier, classification))
+        return classification
 
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Call `func` with the given `args` and `kwargs` according to the rules
@@ -706,6 +750,25 @@ class CircuitBreakerState:
         for listener in self._breaker.listeners:
             listener.success(self._breaker)
 
+    def _handle_result(self, result: Any) -> None:
+        """Handle the `result` of a call to the guarded operation, classifying
+        it with the configured result classifier (if any). Results classified
+        as ``RESULT_IGNORE`` leave the failure and success counters untouched.
+        """
+        classification = self._breaker._classify_result(result)
+        if classification == RESULT_FAILURE:
+            self._handle_failure_result(result)
+        elif classification == RESULT_SUCCESS:
+            self._handle_success()
+
+    def _handle_failure_result(self, result: Any) -> None:
+        """Handle a call whose result was classified as a failure."""
+        exc = CircuitBreakerResultFailure(result)
+        self._breaker._inc_counter()
+        for listener in self._breaker.listeners:
+            listener.failure(self._breaker, exc)
+        self.on_failure_result()
+
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Calls `func` with the given `args` and `kwargs`, and updates the
         circuit breaker state according to the result.
@@ -724,7 +787,7 @@ class CircuitBreakerState:
         except BaseException as e:
             self._handle_error(e)
         else:
-            self._handle_success()
+            self._handle_result(ret)
         return ret
 
     def call_async(self, func, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
@@ -750,7 +813,7 @@ class CircuitBreakerState:
             except BaseException as e:
                 self._handle_error(e)
             else:
-                self._handle_success()
+                self._handle_result(ret)
             raise gen.Return(ret)
 
         return wrapped()
@@ -775,6 +838,11 @@ class CircuitBreakerState:
 
     def on_failure(self, exc: BaseException) -> None:
         """Override this method to be notified when a call to the guarded operation fails."""
+
+    def on_failure_result(self) -> None:
+        """Override this method to be notified when a call to the guarded
+        operation returns a result classified as a failure.
+        """
 
 
 class CircuitClosedState(CircuitBreakerState):
@@ -813,6 +881,18 @@ class CircuitClosedState(CircuitBreakerState):
                 error_msg = "Failures threshold reached, circuit breaker opened"
                 raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
             raise exc
+
+    def on_failure_result(self) -> None:
+        """Move the circuit breaker to the "open" state once the failures
+        threshold is reached. Honors `throw_new_error_on_trip`: when disabled,
+        the caller still receives the original (failing) result.
+        """
+        if self._breaker._state_storage.counter >= self._breaker.fail_max:
+            throw_new_error = self._breaker.open()
+
+            if throw_new_error:
+                error_msg = "Failures threshold reached, circuit breaker opened"
+                raise CircuitBreakerError(error_msg)
 
 
 class CircuitOpenState(CircuitBreakerState):
@@ -889,12 +969,40 @@ class CircuitHalfOpenState(CircuitBreakerState):
             raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
         raise exc
 
+    def on_failure_result(self) -> None:
+        """Opens the circuit breaker. Honors `throw_new_error_on_trip`: when
+        disabled, the caller still receives the original (failing) result.
+        """
+        throw_new_error = self._breaker.open()
+
+        if throw_new_error:
+            error_msg = "Trial call failed, circuit breaker opened"
+            raise CircuitBreakerError(error_msg)
+
     def on_success(self) -> None:
         """Increment success counter and close the circuit breaker if threshold is reached."""
         self._breaker._state_storage.increment_success_counter()
 
         if self._breaker._state_storage.success_counter >= self._breaker.success_threshold:
             self._breaker.close()
+
+
+class CircuitBreakerResultFailure(Exception):
+    """Reported to listeners when a call result is classified as a failure by
+    the result classifier. The classified result is available as `result`.
+    """
+
+    def __init__(self, result: Any) -> None:
+        """Create a new failure signal carrying the classified `result`."""
+        super().__init__(f"Call result classified as failure: {result!r}")
+        self.result = result
+
+
+class CircuitBreakerClassifierError(Exception):
+    """Raised when the result classifier itself fails or returns an invalid
+    classification. Never counted as a success or failure of the guarded
+    operation, so counters and state are left untouched.
+    """
 
 
 class CircuitBreakerError(Exception):

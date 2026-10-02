@@ -239,6 +239,207 @@ class CircuitBreakerStorageBasedTestCase:
         assert self.breaker.fail_counter == 0
         assert self.breaker.current_state == "closed"
 
+    def test_result_classifier_interleaved_results(self):
+        """CircuitBreaker: it should classify results as success, failure or
+        ignore, passing the original result back to the caller.
+        """
+        success_obj = {"status": 200}
+        failure_obj = {"status": 503}
+        ignore_obj = {"status": 102}
+
+        def classifier(result):
+            if result["status"] == 503:
+                return RESULT_FAILURE
+            if result["status"] == 102:
+                return RESULT_IGNORE
+            return RESULT_SUCCESS
+
+        classifier_mock = mock.MagicMock(side_effect=classifier)
+        self.breaker = CircuitBreaker(fail_max=3, result_classifier=classifier_mock, **self.breaker_kwargs)
+
+        def func(result):
+            return result
+
+        # A successful result is returned as-is and counted as a success.
+        assert self.breaker.call(func, success_obj) is success_obj
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "closed"
+
+        # A failing result is still returned to the caller, but counted.
+        assert self.breaker.call(func, failure_obj) is failure_obj
+        assert self.breaker.fail_counter == 1
+        assert self.breaker.current_state == "closed"
+
+        # An ignored result is returned to the caller and counted as nothing.
+        assert self.breaker.call(func, ignore_obj) is ignore_obj
+        assert self.breaker.fail_counter == 1
+        assert self.breaker.current_state == "closed"
+
+        assert self.breaker.call(func, failure_obj) is failure_obj
+        assert self.breaker.fail_counter == 2
+        assert self.breaker.current_state == "closed"
+
+        # A success in between resets the consecutive failure count.
+        assert self.breaker.call(func, success_obj) is success_obj
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "closed"
+
+        # The classifier was called exactly once per call.
+        assert classifier_mock.call_count == 5
+
+    def test_result_classifier_failure_trips_circuit(self):
+        """CircuitBreaker: it should open the circuit once enough results are
+        classified as failures, raising CircuitBreakerError on trip.
+        """
+        failure_obj = {"status": 503}
+        self.breaker = CircuitBreaker(
+            fail_max=2,
+            result_classifier=lambda result: RESULT_FAILURE,
+            **self.breaker_kwargs,
+        )
+
+        def func():
+            return failure_obj
+
+        assert self.breaker.call(func) is failure_obj
+        assert self.breaker.fail_counter == 1
+        assert self.breaker.current_state == "closed"
+
+        # Circuit should open
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(func)
+        assert self.breaker.fail_counter == 2
+        assert self.breaker.current_state == "open"
+
+    def test_result_classifier_failure_no_throw_on_trip(self):
+        """CircuitBreaker: it should return the original result on trip when
+        `throw_new_error_on_trip` is disabled.
+        """
+        failure_obj = {"status": 503}
+        self.breaker = CircuitBreaker(
+            fail_max=2,
+            throw_new_error_on_trip=False,
+            result_classifier=lambda result: RESULT_FAILURE,
+            **self.breaker_kwargs,
+        )
+
+        def func():
+            return failure_obj
+
+        assert self.breaker.call(func) is failure_obj
+        assert self.breaker.call(func) is failure_obj
+        assert self.breaker.fail_counter == 2
+        assert self.breaker.current_state == "open"
+
+        # Circuit should still be open and break
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(func)
+        assert self.breaker.fail_counter == 2
+        assert self.breaker.current_state == "open"
+
+    def test_result_classifier_ignored_result_when_halfopen(self):
+        """CircuitBreaker: it should not count an ignored result as a
+        successful probe in half-open state.
+        """
+        ignore_obj = {"status": 102}
+        success_obj = {"status": 200}
+
+        def classifier(result):
+            if result["status"] == 102:
+                return RESULT_IGNORE
+            return RESULT_SUCCESS
+
+        self.breaker = CircuitBreaker(result_classifier=classifier, **self.breaker_kwargs)
+        self.breaker.half_open()
+
+        # An ignored probe result must not close the circuit.
+        assert self.breaker.call(lambda: ignore_obj) is ignore_obj
+        assert self.breaker.success_counter == 0
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "half-open"
+
+        # A successful probe result closes the circuit.
+        assert self.breaker.call(lambda: success_obj) is success_obj
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "closed"
+
+    def test_result_classifier_failure_when_halfopen(self):
+        """CircuitBreaker: it should open the circuit when a probe result is
+        classified as a failure in half-open state.
+        """
+        failure_obj = {"status": 503}
+        self.breaker = CircuitBreaker(
+            result_classifier=lambda result: RESULT_FAILURE,
+            **self.breaker_kwargs,
+        )
+        self.breaker.half_open()
+
+        # Circuit should open
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(lambda: failure_obj)
+        assert self.breaker.fail_counter == 1
+        assert self.breaker.current_state == "open"
+
+    def test_result_classifier_error(self):
+        """CircuitBreaker: it should report a failing classifier separately,
+        without counting it as a call failure or resetting the counters.
+        """
+        classifier_error = RuntimeError("classifier boom")
+
+        def classifier(result):
+            raise classifier_error
+
+        self.breaker = CircuitBreaker(fail_max=2, result_classifier=classifier, **self.breaker_kwargs)
+
+        def func():
+            return {"status": 200}
+
+        def err():
+            raise NotImplementedError
+
+        # The classifier is not invoked when the call itself raises.
+        with pytest.raises(NotImplementedError):
+            self.breaker.call(err)
+        assert self.breaker.fail_counter == 1
+
+        # A classifier failure is reported separately and counts as nothing.
+        with pytest.raises(CircuitBreakerClassifierError) as excinfo:
+            self.breaker.call(func)
+        assert excinfo.value.__cause__ is classifier_error
+        assert self.breaker.fail_counter == 1
+        assert self.breaker.current_state == "closed"
+
+    def test_result_classifier_invalid_classification(self):
+        """CircuitBreaker: it should report an invalid classification as a
+        classifier error, leaving counters and state untouched.
+        """
+        self.breaker = CircuitBreaker(
+            result_classifier=lambda result: "bogus",
+            **self.breaker_kwargs,
+        )
+
+        with pytest.raises(CircuitBreakerClassifierError):
+            self.breaker.call(lambda: True)
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "closed"
+
+    def test_result_classifier_failure_notifies_listeners(self):
+        """CircuitBreaker: it should notify listeners of results classified
+        as failures.
+        """
+        listener = mock.MagicMock()
+        failure_obj = {"status": 503}
+        self.breaker = CircuitBreaker(
+            result_classifier=lambda result: RESULT_FAILURE,
+            listeners=[listener],
+            **self.breaker_kwargs,
+        )
+
+        assert self.breaker.call(lambda: failure_obj) is failure_obj
+        exc = listener.failure.call_args[0][1]
+        assert isinstance(exc, CircuitBreakerResultFailure)
+        assert exc.result is failure_obj
+
     def test_close(self):
         """CircuitBreaker: it should allow the circuit to be closed manually."""
         self.breaker = CircuitBreaker(fail_max=3, **self.breaker_kwargs)
@@ -507,6 +708,61 @@ class CircuitBreakerConfigurationTestCase:
 
         ret = yield self.breaker.call(func, a=1, b=2)
         assert {"a": 1, "b": 2} == ret
+
+    @testing.gen_test
+    def test_call_async_result_classifier(self):
+        """CircuitBreaker: it should classify async call results, passing the
+        original result back to the caller.
+        """
+        success_obj = {"status": 200}
+        failure_obj = {"status": 503}
+        ignore_obj = {"status": 102}
+
+        def classifier(result):
+            if result["status"] == 503:
+                return RESULT_FAILURE
+            if result["status"] == 102:
+                return RESULT_IGNORE
+            return RESULT_SUCCESS
+
+        self.breaker = CircuitBreaker(fail_max=2, result_classifier=classifier)
+
+        @gen.coroutine
+        def func(result):
+            return result
+
+        ret = yield self.breaker.call_async(func, failure_obj)
+        assert ret is failure_obj
+        assert self.breaker.fail_counter == 1
+
+        ret = yield self.breaker.call_async(func, ignore_obj)
+        assert ret is ignore_obj
+        assert self.breaker.fail_counter == 1
+
+        ret = yield self.breaker.call_async(func, success_obj)
+        assert ret is success_obj
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "closed"
+
+    @testing.gen_test
+    def test_call_async_result_classifier_error(self):
+        """CircuitBreaker: it should report a failing classifier separately
+        for async calls, without touching counters or state.
+        """
+
+        def classifier(result):
+            raise RuntimeError("classifier boom")
+
+        self.breaker = CircuitBreaker(result_classifier=classifier)
+
+        @gen.coroutine
+        def func():
+            return {"status": 200}
+
+        with pytest.raises(CircuitBreakerClassifierError):
+            yield self.breaker.call_async(func)
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "closed"
 
     def test_add_listener(self):
         """CircuitBreaker: it should allow the user to add a listener at a

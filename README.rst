@@ -130,6 +130,36 @@ fail with:
         reset_timeout=60,
         state_storage=pybreaker.CircuitRedisStorage(pybreaker.STATE_CLOSED, get_redis_connection('default'),namespace='unique_namespace'))
 
+Classifying Call Results
+````````````````````````
+
+Some integration points report failures by returning an error object instead
+of raising an exception (e.g. an HTTP response with ``status=503``). Pass a
+``result_classifier`` callable to classify each returned result as
+``RESULT_SUCCESS``, ``RESULT_FAILURE`` or ``RESULT_IGNORE``:
+
+.. code:: python
+
+    import pybreaker
+
+    def classify_response(response):
+        if response.status >= 500:
+            return pybreaker.RESULT_FAILURE
+        if response.status == 404:
+            return pybreaker.RESULT_IGNORE  # not counted at all
+        return pybreaker.RESULT_SUCCESS
+
+    db_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60, result_classifier=classify_response)
+
+The classifier is called exactly once per call, and the original result is
+always returned to the caller unchanged. Results classified as failures
+increment the failure counter and can trip the circuit breaker, honoring
+``throw_new_error_on_trip``; ignored results leave both the failure and
+success counters untouched, so they never count as a successful probe in
+half-open state. If the classifier itself raises or returns an invalid
+classification, a ``CircuitBreakerClassifierError`` is raised and the call is
+counted as neither a success nor a failure.
+
 Event Listening
 ```````````````
 
