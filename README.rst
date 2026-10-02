@@ -260,6 +260,40 @@ Or if you don't want to use the decorator syntax:
     updated_customer = db_breaker.call_async(async_update, my_customer)
 
 
+Native ``asyncio`` Support
+`````````````````````````
+A circuit breaker can also be used with native ``async def`` functions; no
+Tornado dependency or coroutine adapter is required. Just ``await`` the result
+as usual:
+
+.. code:: python
+
+    @db_breaker
+    async def update_customer(cust):
+        # Do async stuff here...
+        pass
+
+    updated_customer = await update_customer(my_customer)
+
+Or using the call API directly:
+
+.. code:: python
+
+    async def update_customer(cust):
+        # Do async stuff here...
+        pass
+
+    updated_customer = await db_breaker.call_async(update_customer, my_customer)
+
+The breaker lock is only held for the short-lived state updates, never while
+awaiting the guarded function, so the event loop is never blocked. If the
+calling task is cancelled (e.g. with ``task.cancel()``), the call is treated
+as a neutral result: it is neither counted as a success nor a failure, and any
+half-open trial slot is released so a later call can go through. Returning a
+non-awaitable object, or using an async generator function directly, raises a
+``TypeError``.
+
+
 Excluding Exceptions
 ````````````````````
 

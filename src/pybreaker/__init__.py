@@ -7,8 +7,10 @@ book at https://pragprog.com/titles/mnee2/release-it-second-edition/
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import contextlib
+import inspect
 import logging
 import sys
 import threading
@@ -101,6 +103,7 @@ class CircuitBreaker:
     ) -> None:
         """Create a new circuit breaker with the given parameters."""
         self._lock = threading.RLock()
+        self._in_flight = 0
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
 
@@ -263,8 +266,24 @@ class CircuitBreaker:
 
         yield from self.call(_wrapper)
 
-    def call_async(self, func, *args, **kwargs):  # type: ignore[no-untyped-def]
+    async def call_async(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Call async `func` with the given `args` and `kwargs` according to the rules
+        implemented by the current state of this circuit breaker.
+
+        Coroutine functions and other callables returning an awaitable are
+        awaited without blocking the event loop. If the awaiting task is
+        cancelled, the call is considered neutral: it is neither counted as a
+        success nor a failure, and a half-open trial slot is released.
+
+        Tornado coroutines (``@gen.coroutine``) are still routed through the
+        legacy Tornado adapter.
+        """
+        if HAS_TORNADO_SUPPORT and getattr(func, "__tornado_coroutine__", False):
+            return await self._call_async_tornado(func, *args, **kwargs)
+        return await self.state.call_async(func, *args, **kwargs)
+
+    def _call_async_tornado(self, func, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """Call Tornado `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
 
         Return a closure to prevent import errors when using without tornado present
@@ -273,7 +292,7 @@ class CircuitBreaker:
         @gen.coroutine
         def wrapped():  # type: ignore[no-untyped-def]
             with self._lock:
-                ret = yield self.state.call_async(func, *args, **kwargs)
+                ret = yield self.state._call_async_tornado(func, *args, **kwargs)
                 raise gen.Return(ret)
 
         return wrapped()
@@ -317,8 +336,15 @@ class CircuitBreaker:
             @wraps(func)
             def _inner_wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
                 if call_async:
-                    return self.call_async(func, *args, **kwargs)
+                    return self._call_async_tornado(func, *args, **kwargs)
                 return self.call(func, *args, **kwargs)
+
+            @wraps(func)
+            async def _inner_wrapper_async(*args: Any, **kwargs: Any) -> Any:
+                return await self.call_async(func, *args, **kwargs)
+
+            if not call_async and inspect.iscoroutinefunction(func):
+                return _inner_wrapper_async
 
             return _inner_wrapper
 
@@ -722,12 +748,16 @@ class CircuitBreakerState:
                 return self.generator_call(ret)
 
         except BaseException as e:
-            self._handle_error(e)
+            try:
+                self._handle_error(e)
+            finally:
+                self._release_half_open_slot()
         else:
             self._handle_success()
+            self._release_half_open_slot()
         return ret
 
-    def call_async(self, func, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+    def _call_async_tornado(self, func, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         """Call async `func` with the given `args` and `kwargs`, and updates the
         circuit breaker state according to the result.
 
@@ -755,6 +785,110 @@ class CircuitBreakerState:
 
         return wrapped()
 
+    async def call_async(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Await `func` with the given `args` and `kwargs`, and update the
+        circuit breaker state according to the result.
+
+        The breaker lock is never held while awaiting the guarded operation,
+        so the event loop keeps running and no other coroutine is blocked on a
+        lock held across an await point. A cancellation of the awaiting task
+        is treated as a neutral outcome and re-raised.
+        """
+        with self._breaker._lock:
+            state, awaitable = self._admit_async(func, *args, **kwargs)
+
+        try:
+            ret = await awaitable
+        except asyncio.CancelledError:
+            state._release_async_slot()
+            raise
+        except BaseException as exc:
+            state._settle_error_async(exc)
+        else:
+            state._settle_success_async()
+            return ret
+
+    def _admit_async(
+        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> tuple[CircuitBreakerState, Any]:
+        """Perform the synchronous admission steps for an async call.
+
+        Runs under the breaker lock. Returns the state object that admitted
+        the call together with the awaitable returned by the guarded
+        function, so settlement can later tell whether the state has changed
+        in the meantime (e.g. manual open/close or a concurrent sync call).
+        """
+        self.before_call(func, *args, **kwargs)
+        for listener in self._breaker.listeners:
+            listener.before_call(self._breaker, func, *args, **kwargs)
+
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as exc:
+            # Settle through the same await path as asynchronous errors so
+            # that counters, state transitions and trial slots are updated
+            # exactly once.
+            future = asyncio.get_running_loop().create_future()
+            future.set_exception(exc)
+            return self, future
+
+        if isinstance(result, types.AsyncGeneratorType):
+            async def reject_async_generator() -> Any:
+                # Close the async generator so its cleanup is not leaked,
+                # then fail the call with an explicit, unambiguous error.
+                await result.aclose()
+                message = "async generator functions are not supported; iterate the async generator explicitly"
+                raise TypeError(message)
+
+            return self, reject_async_generator()
+        if not inspect.isawaitable(result):
+            message = f"object {result!r} returned by {func!r} is not awaitable"
+
+            async def reject_non_awaitable() -> Any:
+                raise TypeError(message)
+
+            return self, reject_non_awaitable()
+
+        return self, result
+
+    def _settle_error_async(self, exc: BaseException) -> None:
+        """Apply an async call failure to the breaker, unless the state has
+        changed while the guarded operation was in progress.
+        """
+        with self._breaker._lock:
+            if self._breaker._state is self:
+                self._handle_error(exc)
+                self._release_half_open_slot()
+            else:
+                # The state changed while the call was in flight (e.g. a
+                # manual switch or a concurrent sync call), so the breaker
+                # bookkeeping must not be applied; the caller still receives
+                # the original exception.
+                raise exc
+
+    def _settle_success_async(self) -> None:
+        """Apply an async call success to the breaker, unless the state has
+        changed while the guarded operation was in progress.
+        """
+        with self._breaker._lock:
+            if self._breaker._state is self:
+                self._handle_success()
+                self._release_half_open_slot()
+
+    def _release_async_slot(self) -> None:
+        """Release a half-open trial slot after a cancellation. Cancellation
+        is a neutral outcome, so it never changes counters or state.
+        """
+        with self._breaker._lock:
+            self._release_half_open_slot()
+
+    def _release_half_open_slot(self) -> None:
+        """Release a half-open trial slot. Called after a call settles or is
+        cancelled, so a following trial gets a chance to run.
+        """
+        if self._breaker._state is self and self.name == STATE_HALF_OPEN:
+            self._breaker._in_flight -= 1
+
     def generator_call(self, wrapped_generator):  # type: ignore[no-untyped-def]
         try:
             value = yield next(wrapped_generator)
@@ -762,9 +896,11 @@ class CircuitBreakerState:
                 value = yield wrapped_generator.send(value)
         except StopIteration:
             self._handle_success()
+            self._release_half_open_slot()
             return
         except BaseException as e:
             self._handle_error(e, reraise=False)
+            self._release_half_open_slot()
             wrapped_generator.throw(e)
 
     def before_call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -801,6 +937,7 @@ class CircuitClosedState(CircuitBreakerState):
             # share a central source of truth (as would be the case with the redis
             # storage).
             self._breaker._state_storage.reset_counter()
+            self._breaker._in_flight = 0
             for listener in self._breaker.listeners:
                 listener.state_change(self._breaker, prev_state, self)
 
@@ -835,6 +972,7 @@ class CircuitOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when opening the circuit
             self._breaker._state_storage.reset_success_counter()
+            self._breaker._in_flight = 0
             for listener in self._breaker.listeners:
                 listener.state_change(self._breaker, prev_state, self)
 
@@ -849,13 +987,37 @@ class CircuitOpenState(CircuitBreakerState):
             error_msg = "Timeout not elapsed yet, circuit breaker still open"
             raise CircuitBreakerError(error_msg)
         self._breaker.half_open()
-        return self._breaker.call(func, *args, **kwargs)
+        return self._breaker.state.call(func, *args, **kwargs)
 
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Delegate the call to before_call, if the time out is not elapsed it will throw an exception, otherwise we get
         the results from the call performed after the state is switch to half-open.
         """
         return self.before_call(func, *args, **kwargs)
+
+    async def call_async(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Admit an async call, moving the circuit to the "half-open" state
+        once the timeout has elapsed.
+        """
+        with self._breaker._lock:
+            timeout = timedelta(seconds=self._breaker.reset_timeout)
+            opened_at = self._breaker._state_storage.opened_at
+            if opened_at and datetime.now(UTC) < opened_at + timeout:
+                error_msg = "Timeout not elapsed yet, circuit breaker still open"
+                raise CircuitBreakerError(error_msg)
+            self._breaker.half_open()
+            state, awaitable = self._breaker.state._admit_async(func, *args, **kwargs)
+
+        try:
+            ret = await awaitable
+        except asyncio.CancelledError:
+            state._release_async_slot()
+            raise
+        except BaseException as exc:
+            state._settle_error_async(exc)
+        else:
+            state._settle_success_async()
+            return ret
 
 
 class CircuitHalfOpenState(CircuitBreakerState):
@@ -877,8 +1039,36 @@ class CircuitHalfOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when entering half-open state
             self._breaker._state_storage.reset_success_counter()
+            self._breaker._in_flight = 0
             for listener in self._breaker._listeners:
                 listener.state_change(self._breaker, prev_state, self)
+
+    def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """Allow only one trial call (sync or async) at a time while the
+        circuit is half-open.
+        """
+        with self._breaker._lock:
+            if self._breaker._in_flight:
+                error_msg = "Trial call already in progress, circuit breaker still half-open"
+                raise CircuitBreakerError(error_msg)
+            self._breaker._in_flight += 1
+            return super().call(func, *args, **kwargs)
+
+    def _admit_async(
+        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> tuple[CircuitBreakerState, Any]:
+        """Allow only one trial call (sync or async) at a time while the
+        circuit is half-open.
+        """
+        if self._breaker._in_flight:
+            error_msg = "Trial call already in progress, circuit breaker still half-open"
+            raise CircuitBreakerError(error_msg)
+        self._breaker._in_flight += 1
+        try:
+            return super()._admit_async(func, *args, **kwargs)
+        except BaseException:
+            self._breaker._in_flight -= 1
+            raise
 
     def on_failure(self, exc: BaseException) -> NoReturn:
         """Opens the circuit breaker."""

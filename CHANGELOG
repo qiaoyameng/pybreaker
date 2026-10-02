@@ -1,6 +1,15 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Add native asyncio support: an awaitable call path and automatic
+  ``async def`` support in the decorator. The breaker lock is not held while
+  awaiting the guarded function, caller cancellation is a neutral outcome
+  that releases the half-open trial slot, and non-awaitable results or
+  async generator functions raise an explicit TypeError.
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
