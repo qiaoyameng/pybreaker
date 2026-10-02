@@ -1169,6 +1169,247 @@ class CircuitBreakerThreadsTestCase(unittest.TestCase):
         assert self.breaker.fail_max == self.breaker.fail_counter
 
 
+class CircuitBreakerHalfOpenProbeTestCase(unittest.TestCase):
+    """Tests for the half-open probe slots limiting concurrent trial calls."""
+
+    def test_rejects_excess_probes_with_identifiable_error(self):
+        """CircuitBreaker: it should reject half-open calls immediately when
+        all probe slots are taken, without entering the guarded function.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=60, half_open_max_concurrent=1)
+        breaker.half_open()
+
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def probe():
+            calls.append("probe")
+            entered.set()
+            release.wait(5)
+            return True
+
+        def rejected():
+            calls.append("rejected")
+
+        thread = threading.Thread(target=lambda: breaker.call(probe))
+        thread.start()
+        assert entered.wait(5)
+        assert breaker.half_open_available_slots == 0
+
+        with pytest.raises(CircuitBreakerHalfOpenError) as exc_info:
+            breaker.call(rejected)
+        assert isinstance(exc_info.value, CircuitBreakerError)
+        assert calls == ["probe"]
+
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert breaker.current_state == "closed"
+
+    def test_stale_probe_success_cannot_close_new_round(self):
+        """CircuitBreaker: it should ignore late successes from a previous
+        half-open round after a probe failure re-opened the circuit.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=60, half_open_max_concurrent=3)
+        breaker.half_open()
+
+        entered_barrier = threading.Barrier(4)  # 3 probes + the main thread
+        gates = [threading.Event() for _ in range(3)]
+        outcomes = ["fail", "ok", "ok"]
+        entered = []
+        results = {}
+
+        def make_probe(index):
+            def probe():
+                entered.append(index)
+                entered_barrier.wait(5)
+                gates[index].wait(5)
+                if outcomes[index] == "fail":
+                    raise RuntimeError("probe failed")
+                return True
+
+            return probe
+
+        def run_probe(index):
+            try:
+                results[index] = ("ok", breaker.call(make_probe(index)))
+            except Exception as exc:
+                results[index] = ("error", exc)
+
+        threads = [threading.Thread(target=run_probe, args=(i,)) for i in range(3)]
+        for thread in threads:
+            thread.start()
+
+        # All three probes are inside the business function at the same time
+        # (which the old global-lock behavior would have deadlocked), holding
+        # all probe slots of the round.
+        entered_barrier.wait(5)
+        assert breaker.half_open_available_slots == 0
+
+        # A fourth call is rejected immediately, without entering the function.
+        with pytest.raises(CircuitBreakerHalfOpenError):
+            breaker.call(lambda: entered.append("rejected"))
+        assert len(entered) == 3
+
+        # 1. The first probe fails, re-opening the circuit.
+        gates[0].set()
+        threads[0].join(5)
+        assert not threads[0].is_alive()
+        assert breaker.current_state == "open"
+        assert isinstance(results[0][1], CircuitBreakerError)
+
+        # 2. Manually enter a new half-open round: all slots are back.
+        breaker.half_open()
+        assert breaker.current_state == "half-open"
+        assert breaker.half_open_available_slots == 3
+
+        # 3. The old probes finally succeed; their stale successes must not
+        # close the circuit of the new round nor count towards the threshold.
+        gates[1].set()
+        gates[2].set()
+        threads[1].join(5)
+        threads[2].join(5)
+        assert not threads[1].is_alive()
+        assert not threads[2].is_alive()
+
+        assert results[1] == ("ok", True)
+        assert results[2] == ("ok", True)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 0
+        assert breaker.half_open_available_slots == 3
+        assert len(entered) == 3
+
+    def test_probe_slot_released_on_excluded_exception(self):
+        """CircuitBreaker: it should return the probe slot when the guarded
+        function raises an excluded exception.
+        """
+        breaker = CircuitBreaker(
+            fail_max=1,
+            reset_timeout=60,
+            success_threshold=2,
+            exclude=[ValueError],
+            half_open_max_concurrent=1,
+        )
+        breaker.half_open()
+
+        def excluded():
+            raise ValueError("business error")
+
+        with pytest.raises(ValueError):
+            breaker.call(excluded)
+
+        # Excluded exceptions count as successes, and the slot is returned.
+        assert breaker.success_counter == 1
+        assert breaker.half_open_available_slots == 1
+        assert breaker.current_state == "half-open"
+
+    def test_probe_slot_released_on_cancellation(self):
+        """CircuitBreaker: it should return the probe slot when the guarded
+        call is cancelled.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=60, half_open_max_concurrent=1)
+        breaker.half_open()
+
+        def cancelled():
+            raise KeyboardInterrupt
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(cancelled)
+
+        assert breaker.half_open_in_flight == 0
+        assert breaker.current_state == "open"
+
+    def test_probe_slot_released_when_generator_closed(self):
+        """CircuitBreaker: it should return the probe slot when a guarded
+        generator is closed before being exhausted.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=60, half_open_max_concurrent=1)
+        breaker.half_open()
+
+        def gen_func():
+            yield 1
+            yield 2
+
+        gen = breaker.call(gen_func)
+        assert next(gen) == 1
+        assert breaker.half_open_in_flight == 1
+
+        with pytest.raises(CircuitBreakerError):
+            gen.close()
+        assert breaker.half_open_in_flight == 0
+        assert breaker.current_state == "open"
+
+    def test_probe_slot_released_on_manual_open_and_close(self):
+        """CircuitBreaker: it should return outstanding probe slots when the
+        circuit is manually opened or closed.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=60, half_open_max_concurrent=1)
+        breaker.half_open()
+
+        entered = threading.Event()
+        release = threading.Event()
+        results = []
+
+        def probe():
+            entered.set()
+            release.wait(5)
+            return True
+
+        def run_probe():
+            results.append(breaker.call(probe))
+
+        thread = threading.Thread(target=run_probe)
+        thread.start()
+        assert entered.wait(5)
+        assert breaker.half_open_in_flight == 1
+
+        # Manually opening the circuit returns the slot; the late success of
+        # the in-flight probe must not affect the opened circuit.
+        breaker.open()
+        assert breaker.half_open_in_flight == 0
+        assert breaker.half_open_available_slots == 1
+
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert results == [True]
+        assert breaker.current_state == "open"
+
+        # Same when manually closing from the half-open state.
+        breaker.half_open()
+        entered.clear()
+        release.clear()
+        thread = threading.Thread(target=run_probe)
+        thread.start()
+        assert entered.wait(5)
+        assert breaker.half_open_in_flight == 1
+
+        breaker.close()
+        assert breaker.half_open_in_flight == 0
+
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert results == [True, True]
+        assert breaker.current_state == "closed"
+        assert breaker.success_counter == 0
+
+    def test_half_open_max_concurrent_validation(self):
+        """CircuitBreaker: it should validate the half_open_max_concurrent setting."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(half_open_max_concurrent=0)
+
+        breaker = CircuitBreaker()
+        assert breaker.half_open_max_concurrent is None
+        assert breaker.half_open_available_slots is None
+
+        breaker.half_open_max_concurrent = 2
+        assert breaker.half_open_available_slots == 2
+        with pytest.raises(ValueError):
+            breaker.half_open_max_concurrent = -1
+
+
 class CircuitBreakerRedisConcurrencyTestCase(unittest.TestCase):
     """Tests to reproduce common concurrency between different machines
     connecting to redis. This is simulated locally using threads.

@@ -59,6 +59,7 @@ except ImportError:
 
 __all__ = (
     "CircuitBreaker",
+    "CircuitBreakerHalfOpenError",
     "CircuitBreakerListener",
     "CircuitBreakerError",
     "CircuitMemoryStorage",
@@ -93,13 +94,26 @@ class CircuitBreaker:
         fail_max: int = 5,
         reset_timeout: float = 60,
         success_threshold: int = 1,
+        half_open_max_concurrent: int | None = None,
         exclude: Iterable[type[ExceptionType] | Callable[[Any], bool]] | None = None,
         listeners: Sequence[CBListenerType] | None = None,
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        When the circuit is half-open, at most `half_open_max_concurrent` probe
+        calls may run concurrently (`None` means unbounded). Calls that cannot
+        get a probe slot are rejected immediately with
+        `CircuitBreakerHalfOpenError`.
+
+        Only completions of probes belonging to the current half-open round
+        count towards `success_threshold`: a successful return (or an excluded
+        exception, which is treated as a success) increments the success
+        counter, while failures and cancellations re-open the circuit, and
+        late completions from a previous round are ignored altogether.
+        """
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
@@ -107,6 +121,10 @@ class CircuitBreaker:
         self._fail_max = fail_max
         self._reset_timeout = reset_timeout
         self._success_threshold = success_threshold
+        self._half_open_max_concurrent: int | None = None
+        self.half_open_max_concurrent = half_open_max_concurrent
+        self._half_open_generation = 0
+        self._half_open_permits: set[_HalfOpenPermit] = set()
 
         self._excluded_exceptions = list(exclude or [])
         self._listeners = list(listeners or [])
@@ -148,13 +166,82 @@ class CircuitBreaker:
 
     @property
     def success_threshold(self) -> int:
-        """Return the number of successful requests required before transitioning from half-open to closed state."""
+        """Return the number of successful requests required before transitioning from half-open to closed state.
+
+        Only completions of probes belonging to the current half-open round
+        are counted: a successful return (or an excluded exception, which is
+        treated as a success) increments the counter, while late completions
+        from a previous round are ignored.
+        """
         return self._success_threshold
 
     @success_threshold.setter
     def success_threshold(self, threshold: int) -> None:
         """Set the number of successful requests required before transitioning from half-open to closed state."""
         self._success_threshold = threshold
+
+    @property
+    def half_open_max_concurrent(self) -> int | None:
+        """Return the maximum number of probe calls allowed to run concurrently
+        in the half-open state, or `None` if unbounded.
+        """
+        return self._half_open_max_concurrent
+
+    @half_open_max_concurrent.setter
+    def half_open_max_concurrent(self, number: int | None) -> None:
+        """Set the maximum `number` of probe calls allowed to run concurrently
+        in the half-open state, or `None` for unbounded.
+        """
+        if number is not None and number < 1:
+            msg = "half_open_max_concurrent must be a positive integer or None"
+            raise ValueError(msg)
+        self._half_open_max_concurrent = number
+
+    @property
+    def half_open_in_flight(self) -> int:
+        """Return the number of half-open probe slots currently in use."""
+        return len(self._half_open_permits)
+
+    @property
+    def half_open_available_slots(self) -> int | None:
+        """Return the number of half-open probe slots still available in the
+        current round, or `None` if the number of probes is unbounded.
+        """
+        if self._half_open_max_concurrent is None:
+            return None
+        return max(0, self._half_open_max_concurrent - len(self._half_open_permits))
+
+    def _acquire_half_open_permit(self) -> _HalfOpenPermit:
+        """Take a half-open probe slot for the current round.
+
+        Must be called with `self._lock` held. Raises
+        `CircuitBreakerHalfOpenError` if all slots are taken.
+        """
+        max_concurrent = self._half_open_max_concurrent
+        if max_concurrent is not None and len(self._half_open_permits) >= max_concurrent:
+            msg = f"Half-open probe limit reached ({max_concurrent} in flight), call rejected"
+            raise CircuitBreakerHalfOpenError(msg)
+        permit = _HalfOpenPermit(self._half_open_generation)
+        self._half_open_permits.add(permit)
+        return permit
+
+    def _release_half_open_permit(self, permit: _HalfOpenPermit) -> bool:
+        """Return a half-open probe slot.
+
+        Must be called with `self._lock` held. Return whether the permit still
+        belongs to the current half-open round; permits revoked by a state
+        transition are stale and their outcome must not affect the new state.
+        """
+        if permit not in self._half_open_permits:
+            return False
+        self._half_open_permits.discard(permit)
+        return permit.generation == self._half_open_generation
+
+    def _revoke_half_open_permits(self) -> None:
+        """Revoke all outstanding half-open probe slots, returning them to the
+        pool. Must be called with `self._lock` held.
+        """
+        self._half_open_permits.clear()
 
     def _create_new_state(
         self,
@@ -178,14 +265,15 @@ class CircuitBreaker:
     @property
     def state(self) -> CBStateType:
         """Update (if needed) and returns the cached state object."""
-        # Ensure cached state is up-to-date
-        if self.current_state != self._state.name:
-            # If cached state is out-of-date, that means that it was likely
-            # changed elsewhere (e.g. another process instance). We still send
-            # out a notification, informing others that this particular circuit
-            # breaker instance noticed the changed circuit.
-            self.state = self.current_state  # type: ignore[assignment]
-        return self._state
+        with self._lock:
+            # Ensure cached state is up-to-date
+            if self.current_state != self._state.name:
+                # If cached state is out-of-date, that means that it was likely
+                # changed elsewhere (e.g. another process instance). We still send
+                # out a notification, informing others that this particular circuit
+                # breaker instance noticed the changed circuit.
+                self.state = self.current_state  # type: ignore[assignment]
+            return self._state
 
     @state.setter
     def state(self, state_str: str) -> None:
@@ -246,9 +334,11 @@ class CircuitBreaker:
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Call `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
+
+        The breaker lock is only held while checking the state and recording
+        the outcome; `func` itself runs without the lock being held.
         """
-        with self._lock:
-            return self.state.call(func, *args, **kwargs)
+        return self.state.call(func, *args, **kwargs)
 
     @contextlib.contextmanager
     def calling(self) -> Any:
@@ -272,15 +362,17 @@ class CircuitBreaker:
 
         @gen.coroutine
         def wrapped():  # type: ignore[no-untyped-def]
-            with self._lock:
-                ret = yield self.state.call_async(func, *args, **kwargs)
-                raise gen.Return(ret)
+            ret = yield self.state.call_async(func, *args, **kwargs)
+            raise gen.Return(ret)
 
         return wrapped()
 
     def open(self) -> bool:
         """Open the circuit, e.g., the following calls will immediately fail until timeout elapses."""
         with self._lock:
+            # Return any outstanding half-open probe slots; their late
+            # completions must not affect the newly opened circuit.
+            self._revoke_half_open_permits()
             self._state_storage.opened_at = datetime.now(UTC)
             self.state = self._state_storage.state = STATE_OPEN  # type: ignore[assignment]
 
@@ -292,11 +384,17 @@ class CircuitBreaker:
         succeeds).
         """
         with self._lock:
+            # Start a new half-open round: probes still in flight from a
+            # previous round become stale and their slots are returned.
+            self._half_open_generation += 1
+            self._revoke_half_open_permits()
             self.state = self._state_storage.state = STATE_HALF_OPEN  # type: ignore[assignment]
 
     def close(self) -> None:
         """Close the circuit, e.g. lets the following calls execute as usual."""
         with self._lock:
+            # Return any outstanding half-open probe slots.
+            self._revoke_half_open_permits()
             self._state_storage.reset_success_counter()  # Reset success counter when closing
             self.state = self._state_storage.state = STATE_CLOSED  # type: ignore[assignment]
 
@@ -679,52 +777,89 @@ class CircuitBreakerState:
         return self._name
 
     @overload
-    def _handle_error(self, exc: BaseException, reraise: Literal[True] = ...) -> NoReturn:
+    def _handle_error(self, exc: BaseException, permit: Any = ..., reraise: Literal[True] = ...) -> NoReturn:
         ...
 
     @overload
-    def _handle_error(self, exc: BaseException, reraise: Literal[False] = ...) -> None:
+    def _handle_error(self, exc: BaseException, permit: Any = ..., reraise: Literal[False] = ...) -> None:
         ...
 
-    def _handle_error(self, exc: BaseException, reraise: bool = True) -> None:
+    def _handle_error(self, exc: BaseException, permit: Any = None, reraise: bool = True) -> None:
         """Handle a failed call to the guarded operation."""
-        if self._breaker.is_system_error(exc):
-            self._breaker._inc_counter()
-            for listener in self._breaker.listeners:
-                listener.failure(self._breaker, exc)
-            self.on_failure(exc)
-        else:
-            self._handle_success()
+        with self._breaker._lock:
+            if not self._release_permit(permit):
+                # The permit belonged to a previous half-open round and was
+                # already revoked; this late outcome must not affect the
+                # current state.
+                if reraise:
+                    raise exc
+                return
+            if self._breaker.is_system_error(exc):
+                self._breaker._inc_counter()
+                for listener in self._breaker.listeners:
+                    listener.failure(self._breaker, exc)
+                self.on_failure(exc)
+            else:
+                self._record_success()
 
         if reraise:
             raise exc
 
-    def _handle_success(self) -> None:
+    def _handle_success(self, permit: Any = None) -> None:
         """Handle a successful call to the guarded operation."""
+        with self._breaker._lock:
+            if not self._release_permit(permit):
+                # Late completion from a previous half-open round; ignore it
+                # so it cannot close the circuit in the current round.
+                return
+            self._record_success()
+
+    def _record_success(self) -> None:
+        """Record a successful call. Must be called with the breaker lock held
+        and the call's permit (if any) already released.
+        """
         self._breaker._state_storage.reset_counter()
         self.on_success()
         for listener in self._breaker.listeners:
             listener.success(self._breaker)
 
+    def _acquire_permit(self) -> Any:
+        """Acquire a permit for the call about to run, if this state limits
+        concurrency. Called with the breaker lock held, just before the guarded
+        function runs. The returned token is passed to `_release_permit`
+        exactly once, whatever the outcome of the call.
+        """
+        return None
+
+    def _release_permit(self, permit: Any) -> bool:
+        """Release the given permit. Called with the breaker lock held. Return
+        whether the call's outcome should still be applied to the breaker
+        state.
+        """
+        return True
+
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Calls `func` with the given `args` and `kwargs`, and updates the
-        circuit breaker state according to the result.
+        circuit breaker state according to the result. The breaker lock is not
+        held while `func` runs.
         """
         ret = None
 
-        self.before_call(func, *args, **kwargs)
-        for listener in self._breaker.listeners:
-            listener.before_call(self._breaker, func, *args, **kwargs)
+        with self._breaker._lock:
+            self.before_call(func, *args, **kwargs)
+            for listener in self._breaker.listeners:
+                listener.before_call(self._breaker, func, *args, **kwargs)
+            permit = self._acquire_permit()
 
         try:
             ret = func(*args, **kwargs)
             if isinstance(ret, types.GeneratorType):
-                return self.generator_call(ret)
+                return self.generator_call(ret, permit)
 
         except BaseException as e:
-            self._handle_error(e)
+            self._handle_error(e, permit)
         else:
-            self._handle_success()
+            self._handle_success(permit)
         return ret
 
     def call_async(self, func, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
@@ -738,33 +873,35 @@ class CircuitBreakerState:
         def wrapped():  # type: ignore[no-untyped-def]
             ret = None
 
-            self.before_call(func, *args, **kwargs)
-            for listener in self._breaker.listeners:
-                listener.before_call(self._breaker, func, *args, **kwargs)
+            with self._breaker._lock:
+                self.before_call(func, *args, **kwargs)
+                for listener in self._breaker.listeners:
+                    listener.before_call(self._breaker, func, *args, **kwargs)
+                permit = self._acquire_permit()
 
             try:
                 ret = yield func(*args, **kwargs)
                 if isinstance(ret, types.GeneratorType):
-                    raise gen.Return(self.generator_call(ret))
+                    raise gen.Return(self.generator_call(ret, permit))
 
             except BaseException as e:
-                self._handle_error(e)
+                self._handle_error(e, permit)
             else:
-                self._handle_success()
+                self._handle_success(permit)
             raise gen.Return(ret)
 
         return wrapped()
 
-    def generator_call(self, wrapped_generator):  # type: ignore[no-untyped-def]
+    def generator_call(self, wrapped_generator, permit=None):  # type: ignore[no-untyped-def]
         try:
             value = yield next(wrapped_generator)
             while True:
                 value = yield wrapped_generator.send(value)
         except StopIteration:
-            self._handle_success()
+            self._handle_success(permit)
             return
         except BaseException as e:
-            self._handle_error(e, reraise=False)
+            self._handle_error(e, permit, reraise=False)
             wrapped_generator.throw(e)
 
     def before_call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -838,7 +975,7 @@ class CircuitOpenState(CircuitBreakerState):
             for listener in self._breaker.listeners:
                 listener.state_change(self._breaker, prev_state, self)
 
-    def before_call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    def before_call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> None:
         """After the timeout elapses, move the circuit breaker to the "half-open"
         state; otherwise, raises ``CircuitBreakerError`` without any attempt
         to execute the real operation.
@@ -849,13 +986,27 @@ class CircuitOpenState(CircuitBreakerState):
             error_msg = "Timeout not elapsed yet, circuit breaker still open"
             raise CircuitBreakerError(error_msg)
         self._breaker.half_open()
-        return self._breaker.call(func, *args, **kwargs)
 
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        """Delegate the call to before_call, if the time out is not elapsed it will throw an exception, otherwise we get
-        the results from the call performed after the state is switch to half-open.
+        """If the timeout has not elapsed, throw an exception; otherwise move
+        to the half-open state and dispatch the call through the breaker so
+        the half-open state (including its probe slots) handles it.
         """
-        return self.before_call(func, *args, **kwargs)
+        with self._breaker._lock:
+            # Re-check under the lock: another thread may have already moved
+            # the breaker out of the open state.
+            if self._breaker.current_state == STATE_OPEN:
+                self.before_call(func, *args, **kwargs)
+        return self._breaker.call(func, *args, **kwargs)
+
+    def call_async(self, func, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """Async variant of `call`: move to the half-open state if the timeout
+        elapsed, then dispatch the call through the breaker.
+        """
+        with self._breaker._lock:
+            if self._breaker.current_state == STATE_OPEN:
+                self.before_call(func, *args, **kwargs)
+        return self._breaker.call_async(func, *args, **kwargs)
 
 
 class CircuitHalfOpenState(CircuitBreakerState):
@@ -896,8 +1047,40 @@ class CircuitHalfOpenState(CircuitBreakerState):
         if self._breaker._state_storage.success_counter >= self._breaker.success_threshold:
             self._breaker.close()
 
+    def _acquire_permit(self) -> Any:
+        """Take a half-open probe slot for the current round, rejecting the
+        call with `CircuitBreakerHalfOpenError` if no slot is available.
+        """
+        return self._breaker._acquire_half_open_permit()
+
+    def _release_permit(self, permit: Any) -> bool:
+        """Return the probe slot taken by this call. The call's outcome only
+        counts if the slot still belongs to the current half-open round.
+        """
+        return self._breaker._release_half_open_permit(permit)
+
 
 class CircuitBreakerError(Exception):
     """When calls to a service fails because the circuit is open, this error is
     raised to allow the caller to handle this type of exception differently.
     """
+
+
+class CircuitBreakerHalfOpenError(CircuitBreakerError):
+    """When a call is rejected because all half-open probe slots are in use,
+    this error is raised so the caller can tell a rejected probe apart from an
+    open circuit. It is a subclass of ``CircuitBreakerError``, so existing
+    handlers keep working.
+    """
+
+
+class _HalfOpenPermit:
+    """Token identifying one in-flight half-open probe and the round it
+    belongs to.
+    """
+
+    __slots__ = ("generation",)
+
+    def __init__(self, generation: int) -> None:
+        """Create a new permit for the given half-open `generation`."""
+        self.generation = generation

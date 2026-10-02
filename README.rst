@@ -73,6 +73,23 @@ requests before closing the circuit breaker:
     # Require 3 successful requests before closing
     db_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60, success_threshold=3)
 
+When the reset timeout elapses, many threads may try to probe the failing
+service at once. You can limit how many probe calls run concurrently in the
+half-open state:
+
+.. code:: python
+
+    # Allow at most 3 concurrent probe calls while half-open
+    db_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60, half_open_max_concurrent=3)
+
+Calls that cannot get a probe slot are rejected immediately with
+``CircuitBreakerHalfOpenError`` (a subclass of ``CircuitBreakerError``). Only
+completions of probes belonging to the current half-open round count towards
+``success_threshold``: a successful return (or an excluded exception, which is
+treated as a success) increments the success counter, while failures and
+cancellations re-open the circuit, and late completions from a previous round
+are ignored.
+
 .. note::
 
   Integration points to external services (i.e. databases, queues, etc) are

@@ -1,6 +1,12 @@
 Changelog
 =========
 
+Version 1.5.0 (unreleased)
+
+* Add half_open_max_concurrent parameter limiting concurrent half-open probe calls; calls without a probe slot are rejected immediately with CircuitBreakerHalfOpenError
+* The circuit breaker lock is no longer held while the guarded function runs
+* Late completions from a previous half-open round no longer affect the current round
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
