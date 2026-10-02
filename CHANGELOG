@@ -1,6 +1,12 @@
 Changelog
 =========
 
+Unreleased
+
+* Add native asyncio support via `CircuitBreaker.call_asyncio` and the
+  `__pybreaker_call_asyncio=True` decorator option, with caller cancellation
+  treated as a neutral outcome
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

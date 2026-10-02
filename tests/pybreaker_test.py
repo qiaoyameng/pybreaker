@@ -1,3 +1,5 @@
+import asyncio
+import gc
 import unittest
 from contextlib import contextmanager
 from datetime import datetime
@@ -380,6 +382,292 @@ class CircuitBreakerStorageBasedTestCase:
         except ValueError as e:
             assert isinstance(e, ValueError)
 
+    def test_call_asyncio_success_and_failure(self):
+        """CircuitBreaker: it should await native asyncio coroutines and count
+        failures according to the exclusion rules.
+        """
+        self.breaker = CircuitBreaker(exclude=[LookupError], **self.breaker_kwargs)
+
+        async def suc():
+            return True
+
+        async def err():
+            raise NotImplementedError
+
+        async def biz_err():
+            raise LookupError
+
+        async def main():
+            assert await self.breaker.call_asyncio(suc)
+
+            with pytest.raises(NotImplementedError):
+                await self.breaker.call_asyncio(err)
+            assert self.breaker.fail_counter == 1
+
+            # LookupError is excluded, so it is not considered a system error
+            with pytest.raises(LookupError):
+                await self.breaker.call_asyncio(biz_err)
+            assert self.breaker.fail_counter == 0
+
+            assert self.breaker.current_state == "closed"
+
+        asyncio.run(main())
+
+    def test_call_asyncio_with_args_and_kwargs(self):
+        """CircuitBreaker: it should be able to invoke asyncio functions with
+        args and kwargs.
+        """
+
+        async def func(arg1, arg2, flag=False):
+            return [arg1, arg2, flag]
+
+        async def main():
+            return await self.breaker.call_asyncio(func, 42, "abc", flag=True)
+
+        assert asyncio.run(main()) == [42, "abc", True]
+
+    def test_call_asyncio_failure_and_cancellation(self):
+        """CircuitBreaker: awaiting the guarded function must not block the
+        event loop; failures are counted, caller cancellation is neutral, and
+        the breaker remains usable afterwards without leaking task exceptions.
+        """
+
+        async def main():
+            loop = asyncio.get_running_loop()
+            loop_problems = []
+            loop.set_exception_handler(lambda _loop, context: loop_problems.append(context))
+
+            fail_gate = asyncio.Event()
+            never = asyncio.Event()
+            spinner_done = asyncio.Event()
+            ticks = 0
+
+            async def spinner():
+                nonlocal ticks
+                while not spinner_done.is_set():
+                    ticks += 1
+                    await asyncio.sleep(0)
+
+            async def failer():
+                await fail_gate.wait()
+                raise NotImplementedError
+
+            async def blocker():
+                await never.wait()
+                return None
+
+            spin_task = asyncio.ensure_future(spinner())
+
+            # One failure, released by an event; the unrelated coroutine keeps
+            # progressing while the guarded call is in flight.
+            fail_task = asyncio.ensure_future(self.breaker.call_asyncio(failer))
+            await asyncio.sleep(0)
+            fail_gate.set()
+            with pytest.raises(NotImplementedError):
+                await fail_task
+            assert self.breaker.fail_counter == 1
+            assert ticks > 0
+
+            # One external cancellation: neutral outcome, in-flight state released.
+            cancel_task = asyncio.ensure_future(self.breaker.call_asyncio(blocker))
+            await asyncio.sleep(0)
+            cancel_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancel_task
+            assert self.breaker.fail_counter == 1
+            assert self.breaker.current_state == "closed"
+
+            # The breaker can be called again after the cancellation.
+            async def suc():
+                return True
+
+            assert await self.breaker.call_asyncio(suc)
+            assert self.breaker.fail_counter == 0
+
+            spinner_done.set()
+            await spin_task
+
+            # No task exception was left unretrieved in the event loop.
+            gc.collect()
+            assert loop_problems == []
+
+        asyncio.run(main())
+
+    def test_call_asyncio_sync_raise(self):
+        """CircuitBreaker: it should handle functions that raise synchronously,
+        before returning an awaitable.
+        """
+
+        def err():
+            raise NotImplementedError
+
+        async def main():
+            with pytest.raises(NotImplementedError):
+                await self.breaker.call_asyncio(err)
+
+        asyncio.run(main())
+        assert self.breaker.fail_counter == 1
+        assert self.breaker.current_state == "closed"
+
+    def test_call_asyncio_non_awaitable_return(self):
+        """CircuitBreaker: it should reject functions that do not return an
+        awaitable, without counting a system failure.
+        """
+
+        def func():
+            return 42
+
+        async def main():
+            with pytest.raises(TypeError):
+                await self.breaker.call_asyncio(func)
+
+        asyncio.run(main())
+        assert self.breaker.fail_counter == 0
+        assert self.breaker.current_state == "closed"
+
+    def test_call_asyncio_async_generator(self):
+        """CircuitBreaker: it should wrap async generators returned by the
+        guarded function, recording the outcome once they are consumed.
+        """
+
+        async def gen():
+            yield 1
+            yield 2
+
+        async def bad_gen():
+            yield 1
+            raise NotImplementedError
+
+        async def main():
+            wrapped = await self.breaker.call_asyncio(gen)
+            assert [value async for value in wrapped] == [1, 2]
+            assert self.breaker.fail_counter == 0
+
+            wrapped = await self.breaker.call_asyncio(bad_gen)
+            with pytest.raises(NotImplementedError):
+                async for _value in wrapped:
+                    pass
+            assert self.breaker.fail_counter == 1
+
+        asyncio.run(main())
+
+    def test_call_asyncio_open_breaker(self):
+        """CircuitBreaker: an open breaker fails asyncio calls fast, then
+        half-opens after the reset timeout elapses.
+        """
+        self.breaker = CircuitBreaker(fail_max=1, reset_timeout=1, **self.breaker_kwargs)
+
+        async def err():
+            raise NotImplementedError
+
+        called = False
+
+        async def suc():
+            nonlocal called
+            called = True
+            return True
+
+        async def main():
+            # Trip the breaker
+            with pytest.raises(CircuitBreakerError):
+                await self.breaker.call_asyncio(err)
+            assert self.breaker.current_state == "open"
+
+            # Calls fail fast without executing the guarded function
+            with pytest.raises(CircuitBreakerError):
+                await self.breaker.call_asyncio(suc)
+            assert not called
+
+            # After the timeout, the next call half-opens the breaker;
+            # wait at least a second since redis rounds to a second
+            await asyncio.sleep(2)
+            assert await self.breaker.call_asyncio(suc)
+            assert called
+            assert self.breaker.current_state == "closed"
+
+        asyncio.run(main())
+
+    def test_call_asyncio_does_not_override_manual_state_change(self):
+        """CircuitBreaker: an in-flight asyncio call must not override a state
+        change that happened while it was being awaited.
+        """
+
+        async def main():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def guarded():
+                entered.set()
+                await release.wait()
+                return True
+
+            task = asyncio.ensure_future(self.breaker.call_asyncio(guarded))
+            await entered.wait()
+
+            # Manually open the breaker while the call is in flight; this also
+            # proves the breaker's lock is not held while awaiting.
+            self.breaker.open()
+
+            release.set()
+            assert await task
+
+        asyncio.run(main())
+        assert self.breaker.current_state == "open"
+
+    def test_call_asyncio_shares_success_threshold_with_sync_calls(self):
+        """CircuitBreaker: asyncio and sync calls share the same success
+        counter when closing the circuit from the half-open state.
+        """
+        self.breaker = CircuitBreaker(
+            fail_max=1,
+            reset_timeout=60,
+            success_threshold=2,
+            **self.breaker_kwargs,
+        )
+        self.breaker.half_open()
+
+        async def suc():
+            return True
+
+        assert self.breaker.call(lambda: True)
+        assert self.breaker.current_state == "half-open"
+
+        async def main():
+            assert await self.breaker.call_asyncio(suc)
+
+        asyncio.run(main())
+        assert self.breaker.current_state == "closed"
+        assert self.breaker.success_counter == 0
+
+    def test_decorator_call_asyncio(self):
+        """CircuitBreaker: it should decorate async def functions for native asyncio."""
+
+        @self.breaker(__pybreaker_call_asyncio=True)
+        async def suc(value):
+            "Docstring"
+            return value
+
+        @self.breaker(__pybreaker_call_asyncio=True)
+        async def err(value):
+            "Docstring"
+            raise NotImplementedError
+
+        assert suc.__doc__ == "Docstring"
+        assert err.__doc__ == "Docstring"
+        assert suc.__name__ == "suc"
+        assert err.__name__ == "err"
+
+        async def main():
+            with pytest.raises(NotImplementedError):
+                await err(True)
+            assert self.breaker.fail_counter == 1
+
+            assert await suc(True)
+            assert self.breaker.fail_counter == 0
+
+        asyncio.run(main())
+
+
 
 class CircuitBreakerConfigurationTestCase:
     """Tests for the CircuitBreaker class."""
@@ -507,7 +795,6 @@ class CircuitBreakerConfigurationTestCase:
 
         ret = yield self.breaker.call(func, a=1, b=2)
         assert {"a": 1, "b": 2} == ret
-
     def test_add_listener(self):
         """CircuitBreaker: it should allow the user to add a listener at a
         later time.

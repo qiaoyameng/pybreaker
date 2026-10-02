@@ -7,8 +7,10 @@ book at https://pragprog.com/titles/mnee2/release-it-second-edition/
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import contextlib
+import inspect
 import logging
 import sys
 import threading
@@ -30,7 +32,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Sequence
+    from collections.abc import AsyncGenerator, Generator, Iterable, Sequence
 
 # For compatibility with Python 3.10 and earlier.
 # Otherwise, `from datetime import UTC` would suffice.
@@ -278,6 +280,17 @@ class CircuitBreaker:
 
         return wrapped()
 
+    async def call_asyncio(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Call async `func` with the given `args` and `kwargs` according to the rules
+        implemented by the current state of this circuit breaker.
+
+        Unlike `call_async`, this is a native `asyncio` coroutine and does not
+        require Tornado. The breaker's lock is not held while `func` is being
+        awaited, so the event loop is never blocked and concurrent sync calls
+        or manual state changes can proceed while the call is in flight.
+        """
+        return await self.state.call_asyncio(func, *args, **kwargs)
+
     def open(self) -> bool:
         """Open the circuit, e.g., the following calls will immediately fail until timeout elapses."""
         with self._lock:
@@ -304,16 +317,27 @@ class CircuitBreaker:
         """Return a wrapper that calls the function `func` according to the rules
         implemented by the current state of this circuit breaker.
 
-        Optionally takes the keyword argument `__pybreaker_call_coroutine`,
-        which will will call `func` as a Tornado co-routine.
+        Optionally takes the keyword argument `__pybreaker_call_async`, which
+        will call `func` as a Tornado co-routine, or the keyword argument
+        `__pybreaker_call_asyncio`, which will await `func` as a native
+        `asyncio` coroutine.
         """
         call_async = call_kwargs.pop("__pybreaker_call_async", False)
+        call_asyncio = call_kwargs.pop("__pybreaker_call_asyncio", False)
 
         if call_async and not HAS_TORNADO_SUPPORT:
             message = "No module named tornado"
             raise ImportError(message)
 
         def _outer_wrapper(func):  # type: ignore[no-untyped-def]
+            if call_asyncio:
+
+                @wraps(func)
+                async def _asyncio_inner_wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+                    return await self.call_asyncio(func, *args, **kwargs)
+
+                return _asyncio_inner_wrapper
+
             @wraps(func)
             def _inner_wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
                 if call_async:
@@ -755,6 +779,75 @@ class CircuitBreakerState:
 
         return wrapped()
 
+    async def call_asyncio(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Call async `func` with the given `args` and `kwargs`, and updates the
+        circuit breaker state according to the result.
+
+        This is a native `asyncio` coroutine; no Tornado dependency is needed.
+        The guarded operation is awaited without holding the breaker's lock, so
+        the event loop stays responsive. Cancellation by the caller is treated
+        as a neutral outcome: it is neither counted as a failure nor as a
+        success, and the in-flight call leaves no state behind. Outcomes are
+        reported to the breaker's current state, so a state change that
+        happened while the call was in flight (e.g. a manual `open()`) is not
+        overridden.
+        """
+        ret = None
+
+        self.before_call(func, *args, **kwargs)
+        for listener in self._breaker.listeners:
+            listener.before_call(self._breaker, func, *args, **kwargs)
+
+        try:
+            ret = func(*args, **kwargs)
+        except BaseException as e:
+            # The function failed synchronously, before returning an awaitable.
+            self._handle_error(e)
+
+        if isinstance(ret, types.AsyncGeneratorType):
+            return self.async_generator_call(ret)
+        if not inspect.isawaitable(ret):
+            msg = f"Expected {func!r} to return an awaitable, got {ret!r} instead"
+            raise TypeError(msg)
+
+        try:
+            result = await ret
+        except asyncio.CancelledError:
+            # Cancellation by the caller is neutral: the guarded operation
+            # neither succeeded nor failed, so leave counters and state alone.
+            raise
+        except BaseException as e:
+            self._breaker.state._handle_error(e)
+        else:
+            self._breaker.state._handle_success()
+        return result
+
+    async def async_generator_call(
+        self,
+        wrapped_async_generator: AsyncGenerator[Any, Any],
+    ) -> AsyncGenerator[Any, Any]:
+        """Wrap an async generator returned by the guarded operation, recording
+        success once it is exhausted or failure if it raises.
+        """
+        try:
+            value = yield await wrapped_async_generator.__anext__()
+            while True:
+                value = yield await wrapped_async_generator.asend(value)
+        except StopAsyncIteration:
+            self._breaker.state._handle_success()
+            return
+        except asyncio.CancelledError:
+            # Cancellation by the caller is neutral; see `call_asyncio`.
+            raise
+        except BaseException as e:
+            self._breaker.state._handle_error(e, reraise=False)
+            # Forward the exception into the wrapped generator, in case it can
+            # handle it; unlike `generator.throw`, `athrow` on an exhausted
+            # async generator does not re-raise, so always re-raise below.
+            with contextlib.suppress(StopAsyncIteration):
+                await wrapped_async_generator.athrow(e)
+            raise
+
     def generator_call(self, wrapped_generator):  # type: ignore[no-untyped-def]
         try:
             value = yield next(wrapped_generator)
@@ -856,6 +949,18 @@ class CircuitOpenState(CircuitBreakerState):
         the results from the call performed after the state is switch to half-open.
         """
         return self.before_call(func, *args, **kwargs)
+
+    async def call_asyncio(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Fail immediately with ``CircuitBreakerError`` if the timeout has not
+        elapsed; otherwise move to "half-open" and delegate the call.
+        """
+        timeout = timedelta(seconds=self._breaker.reset_timeout)
+        opened_at = self._breaker._state_storage.opened_at
+        if opened_at and datetime.now(UTC) < opened_at + timeout:
+            error_msg = "Timeout not elapsed yet, circuit breaker still open"
+            raise CircuitBreakerError(error_msg)
+        self._breaker.half_open()
+        return await self._breaker.call_asyncio(func, *args, **kwargs)
 
 
 class CircuitHalfOpenState(CircuitBreakerState):

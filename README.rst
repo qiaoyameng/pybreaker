@@ -22,6 +22,7 @@ Features
 * Thread-safe
 * Optional redis backing
 * Optional support for asynchronous Tornado calls
+* Optional support for native asyncio coroutines
 
 
 Requirements
@@ -258,6 +259,34 @@ Or if you don't want to use the decorator syntax:
         pass
 
     updated_customer = db_breaker.call_async(async_update, my_customer)
+
+
+Optional asyncio Support
+````````````````````````
+A circuit breaker can (optionally) be used to await native ``asyncio``
+coroutines, without requiring Tornado:
+
+.. code:: python
+
+    @db_breaker(__pybreaker_call_asyncio=True)
+    async def async_update(cust):
+        # Do async stuff here...
+        pass
+
+Or if you don't want to use the decorator syntax:
+
+.. code:: python
+
+    async def async_update(cust):
+        # Do async stuff here...
+        pass
+
+    updated_customer = await db_breaker.call_asyncio(async_update, my_customer)
+
+The guarded coroutine is awaited without holding the breaker's lock, so the
+event loop stays responsive while the call is in flight. Cancelling the call
+is treated as a neutral outcome: it is recorded neither as a failure nor as a
+success.
 
 
 Excluding Exceptions
