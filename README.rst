@@ -177,6 +177,41 @@ To add listeners to a circuit breaker:
     db_breaker.add_listeners(OneListener(), AnotherListener())
 
 
+Isolated State-Change Notifications
+```````````````````````````````````
+
+By default, ``state_change`` listeners are called synchronously while the
+circuit breaker holds its state lock, so a slow or reentrant listener can
+interfere with the breaker. To decouple listener execution from the state
+lock, route notifications through a ``StateChangeNotifier``:
+
+.. code:: python
+
+    def on_error(exc, event, listener):
+        "Called when a listener fails while handling a state change."
+        logging.error("Listener %r failed on %r", listener, event, exc_info=exc)
+
+    notifier = pybreaker.StateChangeNotifier(on_error=on_error)
+    db_breaker = pybreaker.CircuitBreaker(listeners=[DBListener()], notifier=notifier)
+
+With a notifier in place, each state transition is committed first and then
+queued, with a monotonically increasing sequence number, for delivery to the
+snapshot of listeners registered at commit time. Listener registrations or
+removals only affect transitions committed afterwards. A listener that
+triggers a new transition (e.g. by calling ``close()``) does not recurse into
+the current dispatch; the new event is delivered after the current one. A
+failing listener neither rolls back the committed state nor prevents the
+remaining listeners from running; the failure is reported through ``on_error``
+(or logged, if no handler was given).
+
+Call ``notifier.close()`` to stop the notifier, waiting until all accepted
+events have been delivered:
+
+.. code:: python
+
+    notifier.close()
+
+
 What Does a Circuit Breaker Do?
 ```````````````````````````````
 

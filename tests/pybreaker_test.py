@@ -1,4 +1,5 @@
 import unittest
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from time import sleep
@@ -1350,6 +1351,139 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         mock_fn.assert_called_once()
         assert breaker.fail_counter == 0
         assert breaker.current_state == "closed"
+
+
+class StateChangeNotifierTestCase(unittest.TestCase):
+    """Tests for the isolated state-change notification mode."""
+
+    def test_events_dispatched_in_commit_order(self):
+        """StateChangeNotifier: it should dispatch every committed transition
+        exactly once, in commit order.
+        """
+        recorded = []
+
+        class Listener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                recorded.append((old_state.name if old_state else None, new_state.name))
+
+        notifier = StateChangeNotifier()
+        breaker = CircuitBreaker(listeners=[Listener()], notifier=notifier)
+
+        breaker.open()
+        breaker.half_open()
+        breaker.close()
+        notifier.close()
+
+        assert recorded == [
+            ("closed", "open"),
+            ("open", "half-open"),
+            ("half-open", "closed"),
+        ]
+
+    def test_listener_snapshot_taken_at_commit_time(self):
+        """StateChangeNotifier: listener registrations should only affect
+        transitions committed afterwards.
+        """
+        recorded = []
+
+        class Listener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                recorded.append((old_state.name if old_state else None, new_state.name))
+
+        notifier = StateChangeNotifier()
+        breaker = CircuitBreaker(notifier=notifier)
+
+        # Committed before the listener was registered.
+        breaker.open()
+        breaker.add_listener(Listener())
+        breaker.close()
+        notifier.close()
+
+        assert recorded == [("open", "closed")]
+
+    def test_reentrant_failing_listener_is_isolated(self):
+        """StateChangeNotifier: a listener that removes itself, triggers a new
+        transition and raises should neither corrupt the committed state nor
+        skip other listeners; the failure goes to the error channel.
+        """
+        recorded = []
+        errors = []
+
+        class ChaosListener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                cb.remove_listener(self)
+                cb.close()
+                raise RuntimeError("boom")
+
+        class RecordingListener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                recorded.append((old_state.name if old_state else None, new_state.name))
+
+        notifier = StateChangeNotifier(on_error=lambda exc, event, listener: errors.append((exc, event.sequence)))
+        breaker = CircuitBreaker(listeners=[ChaosListener(), RecordingListener()], notifier=notifier)
+
+        breaker.open()
+        notifier.close()
+
+        # The reentrant close() is queued after the current event, and the
+        # self-removed chaos listener is absent from its snapshot.
+        assert recorded == [("closed", "open"), ("open", "closed")]
+        assert breaker.current_state == "closed"
+        assert len(errors) == 1
+        assert isinstance(errors[0][0], RuntimeError)
+        assert errors[0][1] == 1
+
+    def test_close_waits_for_accepted_events(self):
+        """StateChangeNotifier: closing should wait until all accepted events
+        have been delivered.
+        """
+        delivered = threading.Event()
+
+        class SlowListener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                sleep(0.05)
+                delivered.set()
+
+        notifier = StateChangeNotifier()
+        breaker = CircuitBreaker(listeners=[SlowListener()], notifier=notifier)
+
+        breaker.open()
+        notifier.close()
+
+        assert delivered.is_set()
+        assert notifier.closed
+
+    def test_submit_after_close_is_dropped(self):
+        """StateChangeNotifier: events submitted after close should be dropped
+        without raising.
+        """
+        notifier = StateChangeNotifier()
+        notifier.close()
+
+        breaker = CircuitBreaker(notifier=notifier)
+        breaker.open()
+        notifier.flush()
+
+        assert breaker.current_state == "open"
+
+    def test_default_error_channel_logs(self):
+        """StateChangeNotifier: listener failures should be logged when no
+        error handler is configured.
+        """
+
+        class FailingListener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                raise RuntimeError("boom")
+
+        notifier = StateChangeNotifier()
+        breaker = CircuitBreaker(listeners=[FailingListener()], notifier=notifier)
+
+        with self.assertLogs("pybreaker", level="ERROR"):
+            breaker.open()
+            notifier.flush()
+        notifier.close()
+
+        assert breaker.current_state == "open"
 
 
 if __name__ == "__main__":

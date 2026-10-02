@@ -1,6 +1,12 @@
 Changelog
 =========
 
+Unreleased
+
+* Add StateChangeNotifier: opt-in isolated state-change notifications delivered
+  outside the breaker state lock, with listener snapshots, queued reentrant
+  transitions, and a dedicated error channel
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
